@@ -18,11 +18,16 @@ REPO_ID = "Kumarverma11/PocketFM_Audio"
 SOURCE_FOLDER = "Transcripts_Episode_0001_to_0200"
 TARGET_FOLDER = "Studio_Grammar_Corrected_Deep_Reasoning" 
 
-# Groq ka sabse powerful reasoning model
-MODEL_ID = 'llama3-70b-8192' 
-
 hf_api = HfApi()
 client = Groq(api_key=GROQ_API_KEY)
+
+# Groq ke naye aur active models ki list (Agar ek fail hua, toh agla chalega)
+ACTIVE_MODELS = [
+    "Qwen3.6 27B",
+    "llama-3.1-70b-versatile",
+    "mixtral-8x7b-32768",
+    "gemma2-9b-it"
+]
 
 # ==========================================
 # 2. DEEP REASONING PROMPT
@@ -91,7 +96,7 @@ while pass_count <= MAX_PASSES:
         confirmation_count = 0 
         
     print(f"⚠️ {len(missing_eps)} Episodes abhi bhi bache hain: {missing_eps}")
-    print("🚀 Groq Model ke sath process shuru kar rahe hain...\n")
+    print("🚀 Groq Multi-Model ke sath process shuru kar rahe hain...\n")
     
     # 3. MISSING EPISODES PROCESSING
     for idx, ep in enumerate(missing_eps):
@@ -107,11 +112,12 @@ while pass_count <= MAX_PASSES:
                 
             fixed_text = None
             
-            # API Retries for Groq
+            # Auto-Switch Model Logic (4 attempts ke liye 4 alag models try karega)
             for attempt in range(4):
+                current_model = ACTIVE_MODELS[attempt % len(ACTIVE_MODELS)]
                 try:
                     completion = client.chat.completions.create(
-                        model=MODEL_ID,
+                        model=current_model,
                         messages=[
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": f"TEXT:\n{raw_text}"}
@@ -124,8 +130,8 @@ while pass_count <= MAX_PASSES:
                         fixed_text = text.strip()
                         break 
                 except Exception as api_e:
-                    print(f"  ⚠️ Attempt {attempt+1} Groq API Error: {api_e}. Retrying...")
-                    time.sleep(5)
+                    print(f"  ⚠️ {current_model} fail hua: {api_e}. Switching to next model...")
+                    time.sleep(3)
             
             if not fixed_text:
                 print(f"❌ {filename} is pass mein theek nahi ho paaya. Next pass mein isko fir se pakdenge.")
@@ -133,6 +139,7 @@ while pass_count <= MAX_PASSES:
                 
             # Extra text cleanup
             fixed_text = re.sub(r'^(यहाँ आपका टेक्स्ट.*?है:?\s*)', '', fixed_text, flags=re.IGNORECASE)
+            fixed_text = re.sub(r'^(ये रहा आपका.*?है:?\s*)', '', fixed_text, flags=re.IGNORECASE)
                 
             temp_save_path = f"./{filename}"
             with open(temp_save_path, 'w', encoding='utf-8') as f:
@@ -144,7 +151,7 @@ while pass_count <= MAX_PASSES:
                 repo_id=REPO_ID,
                 repo_type="dataset",
                 token=HF_TOKEN,
-                commit_message=f"Groq Reasoning Grammar Fix for {filename}"
+                commit_message=f"Deep Reasoning Grammar Fix for {filename}"
             )
             print(f"  ✅ {filename} Successfully Uploaded!")
             if os.path.exists(temp_save_path): os.remove(temp_save_path)
@@ -152,12 +159,11 @@ while pass_count <= MAX_PASSES:
         except Exception as e:
             print(f"❌ System Error on {filename}: {e}")
             
-        # Groq Rate Limit Protection (Very Important)
-        time.sleep(4) 
+        # Groq Rate Limit Protection 
+        time.sleep(3) 
         
     print(f"\n⏳ Loop {pass_count} pura hua. HF Update ke liye 30 second wait kar rahe hain...")
     time.sleep(30)
     pass_count += 1
 
 print("\n🚨 SCRIPT STOPPED: Max passes poore ho gaye hain.")
-            
