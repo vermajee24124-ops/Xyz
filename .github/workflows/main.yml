@@ -1,29 +1,9 @@
-name: Audio Series Grammar Fixer
-
-on:
-  workflow_dispatch: # Button daba kar manually run karne ke liye
-
-jobs:
-  process_episodes:
-    runs-on: ubuntu-latest
-    
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-        
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-          
       - name: Install Dependencies
-        run: pip install google-genai huggingface_hub
+        run: pip install groq huggingface_hub
         
       - name: Run Grammar Fixer
         env:
-          GEMINI_KEY_1: ${{ secrets.GEMINI_KEY_1 }}
-          GEMINI_KEY_2: ${{ secrets.GEMINI_KEY_2 }}
-          GEMINI_KEY_3: ${{ secrets.GEMINI_KEY_3 }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: python grammar_fixer.py
-
+        
