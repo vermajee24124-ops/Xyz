@@ -65,15 +65,18 @@ safe_config = types.GenerateContentConfig(
 )
 
 # ==========================================
-# 3. AUTO-VALIDATION & PROCESSING LOOP
+# 3. ZIDDI AUTO-LOOP (SELF-HEALING ARCHITECTURE)
 # ==========================================
-MAX_PASSES = 5 # Code maximum 5 baar ghoom kar verify karega
 expected_eps = set(range(1, 201))
+confirmation_count = 0
+TARGET_CONFIRMATIONS = 3
+pass_count = 1
+MAX_PASSES = 25 # Loop tab tak chalega jab tak kaam khatam na ho (limit 25 ki hai taaki server hang na ho)
 
-for pass_num in range(1, MAX_PASSES + 1):
-    print(f"\n{'='*50}")
-    print(f"🔄 --- PASS {pass_num} / {MAX_PASSES} : HUGGING FACE SCANNING ---")
-    print(f"{'='*50}\n")
+while pass_count <= MAX_PASSES:
+    print(f"\n{'='*60}")
+    print(f"🔄 --- LOOP PASS {pass_count} : HUGGING FACE SCANNING ---")
+    print(f"{'='*60}\n")
     
     # 1. Hugging Face ko scan karna
     try:
@@ -92,19 +95,30 @@ for pass_num in range(1, MAX_PASSES + 1):
 
     missing_eps = sorted(list(expected_eps - target_eps))
     
+    # 2. CONFIRMATION CHECK
     if not missing_eps:
-        print("🎉 BADHAI HO! 100% (200/200) Episodes successfully fix aur upload ho chuke hain! Mission Complete!")
-        exit(0) # Loop aur code yahan successfully band ho jayega
+        confirmation_count += 1
+        print(f"✅ CONFIRMATION {confirmation_count}/{TARGET_CONFIRMATIONS} SUCCESS: 200/200 Episodes mil gaye!")
         
-    print(f"⚠️ {len(missing_eps)} Episodes bache hain: {missing_eps}")
-    print("🚀 Inko theek karna shuru kar rahe hain...\n")
+        if confirmation_count >= TARGET_CONFIRMATIONS:
+            print("\n🎉 MISSION 100% ACCOMPLISHED! Teeno confirmations pass ho gaye. Ab script chain ki saans le rahi hai. BINGE-WORTHY series ready hai!")
+            exit(0)
+        else:
+            print("⏳ Agli confirmation ke liye 15 seconds wait kar rahe hain...")
+            time.sleep(15)
+            continue
+    else:
+        confirmation_count = 0 # Agar ek bhi missing mil gaya, toh confirmation reset ho jayegi
+        
+    print(f"⚠️ {len(missing_eps)} Episodes abhi bhi bache hain: {missing_eps}")
+    print("🚀 Firse shuru karte hain...\n")
     
-    # 2. Missing Episodes ko Process karna
+    # 3. MISSING EPISODES PROCESSING
     for idx, ep in enumerate(missing_eps):
         filename = f"Episode_{ep:04d}.txt"
         source_path = f"{SOURCE_FOLDER}/{filename}"
         
-        print(f"[{idx+1}/{len(missing_eps)}] Processing {filename}...")
+        print(f"[{idx+1}/{len(missing_eps)}] Theek kiya jaa raha hai: {filename}...")
         
         try:
             local_path = hf_hub_download(repo_id=REPO_ID, filename=source_path, repo_type="dataset", token=HF_TOKEN)
@@ -113,8 +127,8 @@ for pass_num in range(1, MAX_PASSES + 1):
                 
             fixed_text = None
             
-            # API Retries
-            for attempt in range(3):
+            # API Retries (4 koshish karega har file par)
+            for attempt in range(4):
                 try:
                     client = get_next_client()
                     response = client.models.generate_content(
@@ -129,18 +143,18 @@ for pass_num in range(1, MAX_PASSES + 1):
                             fixed_text = text.strip()
                             break 
                     except Exception as e:
-                        reason = response.candidates[0].finish_reason if response.candidates else "Unknown"
-                        print(f"  ⚠️ Attempt {attempt+1} Blocked ({reason}). Retrying...")
-                        time.sleep(5) # Timeout badha diya hai
+                        reason = response.candidates[0].finish_reason if response.candidates else "Unknown Block/Error"
+                        print(f"  ⚠️ Attempt {attempt+1} Blocked/Failed ({reason}). Retrying...")
+                        time.sleep(5) 
                 except Exception as api_e:
-                    print(f"  ⚠️ Attempt {attempt+1} API Error: {api_e}. Retrying...")
+                    print(f"  ⚠️ Attempt {attempt+1} API Network Error: {api_e}. Retrying...")
                     time.sleep(5)
             
             if not fixed_text:
-                print(f"❌ {filename} fail ho gaya. Next pass mein dobara check hoga.")
+                print(f"❌ {filename} is pass mein theek nahi ho paaya. Next pass mein isko fir se pakdenge.")
                 continue
                 
-            # Extra text hata dena
+            # Extra text cleanup
             fixed_text = re.sub(r'^(यहाँ आपका टेक्स्ट.*?है:?\s*)', '', fixed_text, flags=re.IGNORECASE)
                 
             temp_save_path = f"./{filename}"
@@ -153,18 +167,18 @@ for pass_num in range(1, MAX_PASSES + 1):
                 repo_id=REPO_ID,
                 repo_type="dataset",
                 token=HF_TOKEN,
-                commit_message=f"Deep Reasoning Grammar Fix for {filename}"
+                commit_message=f"Auto-Loop Grammar Fix for {filename}"
             )
-            print(f"  ✅ {filename} fixed & uploaded!")
+            print(f"  ✅ {filename} Successfully Uploaded!")
             if os.path.exists(temp_save_path): os.remove(temp_save_path)
             
         except Exception as e:
-            print(f"❌ Error on {filename}: {e}")
+            print(f"❌ System Error on {filename}: {e}")
             
-        time.sleep(2) # API Rate Limit safe zone
+        time.sleep(2) # Safe zone
         
-    print(f"\n⏳ Pass {pass_num} processing khatam. Agle pass mein wapas HF ko verify karenge...")
-    time.sleep(10) # Repo ko update hone ka time dene ke liye thoda wait
+    print(f"\n⏳ Loop {pass_count} pura hua. API server ko saans lene ke liye 30 second de rahe hain...")
+    time.sleep(30) # Uploaded files index hone ke liye lamba wait
+    pass_count += 1
 
-print(f"\n🚨 Max {MAX_PASSES} Passes pure ho gaye. Code band ho raha hai. Ek baar logs check kar lijiye.")
-    
+print("\n🚨 SCRIPT STOPPED: Max 25 passes poore ho gaye hain par files abhi bhi bachi hain. Logs check karein.")
