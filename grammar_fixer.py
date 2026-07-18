@@ -21,12 +21,11 @@ TARGET_FOLDER = "Studio_Grammar_Corrected_Deep_Reasoning"
 hf_api = HfApi()
 client = Groq(api_key=GROQ_API_KEY)
 
-# Groq ke naye aur active models ki list (Agar ek fail hua, toh agla chalega)
+# Naye Reasoning Models ki list (Qwen sabse upar, uske baad GPT-OSS)
 ACTIVE_MODELS = [
-    "Qwen3.6 27B",
-    "llama-3.1-70b-versatile",
-    "mixtral-8x7b-32768",
-    "gemma2-9b-it"
+    "qwen/qwen3.6-27b",
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b"
 ]
 
 # ==========================================
@@ -56,7 +55,7 @@ expected_eps = set(range(1, 201))
 confirmation_count = 0
 TARGET_CONFIRMATIONS = 3
 pass_count = 1
-MAX_PASSES = 20 # Loop limit
+MAX_PASSES = 20 
 
 while pass_count <= MAX_PASSES:
     print(f"\n{'='*60}")
@@ -86,7 +85,7 @@ while pass_count <= MAX_PASSES:
         print(f"✅ CONFIRMATION {confirmation_count}/{TARGET_CONFIRMATIONS} SUCCESS: 200/200 Episodes mil gaye!")
         
         if confirmation_count >= TARGET_CONFIRMATIONS:
-            print("\n🎉 MISSION 100% ACCOMPLISHED! Teeno confirmations pass ho gaye. Groq ne saara kaam nipta diya!")
+            print("\n🎉 MISSION 100% ACCOMPLISHED! Teeno confirmations pass ho gaye. Naye Reasoning Models ne saara kaam nipta diya!")
             exit(0)
         else:
             print("⏳ Agli confirmation ke liye 10 seconds wait kar rahe hain...")
@@ -96,14 +95,14 @@ while pass_count <= MAX_PASSES:
         confirmation_count = 0 
         
     print(f"⚠️ {len(missing_eps)} Episodes abhi bhi bache hain: {missing_eps}")
-    print("🚀 Groq Multi-Model ke sath process shuru kar rahe hain...\n")
+    print("🚀 Qwen & GPT-OSS Reasoning Models ke sath process shuru kar rahe hain...\n")
     
     # 3. MISSING EPISODES PROCESSING
     for idx, ep in enumerate(missing_eps):
         filename = f"Episode_{ep:04d}.txt"
         source_path = f"{SOURCE_FOLDER}/{filename}"
         
-        print(f"[{idx+1}/{len(missing_eps)}] Groq Theek kar raha hai: {filename}...")
+        print(f"[{idx+1}/{len(missing_eps)}] Theek kar raha hai: {filename}...")
         
         try:
             local_path = hf_hub_download(repo_id=REPO_ID, filename=source_path, repo_type="dataset", token=HF_TOKEN)
@@ -112,22 +111,28 @@ while pass_count <= MAX_PASSES:
                 
             fixed_text = None
             
-            # Auto-Switch Model Logic (4 attempts ke liye 4 alag models try karega)
-            for attempt in range(4):
-                current_model = ACTIVE_MODELS[attempt % len(ACTIVE_MODELS)]
+            # Auto-Switch Model Logic (Naye Reasoning Models ke sath)
+            for attempt in range(len(ACTIVE_MODELS)):
+                current_model = ACTIVE_MODELS[attempt]
                 try:
+                    # Naya API Call Structure
                     completion = client.chat.completions.create(
                         model=current_model,
                         messages=[
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": f"TEXT:\n{raw_text}"}
                         ],
-                        temperature=0.2,
+                        temperature=0.3, # Grammar ke liye balanced
+                        max_completion_tokens=4096, # Lamba episode cover karne ke liye
+                        top_p=1,
+                        reasoning_effort="high", # Deep thinking mode ON
+                        stream=False # Auto-script ke liye False rakhna behtar hai
                     )
                     
                     text = completion.choices[0].message.content
                     if text:
                         fixed_text = text.strip()
+                        print(f"  🧠 Processed successfully using {current_model}")
                         break 
                 except Exception as api_e:
                     print(f"  ⚠️ {current_model} fail hua: {api_e}. Switching to next model...")
@@ -151,7 +156,7 @@ while pass_count <= MAX_PASSES:
                 repo_id=REPO_ID,
                 repo_type="dataset",
                 token=HF_TOKEN,
-                commit_message=f"Deep Reasoning Grammar Fix for {filename}"
+                commit_message=f"Deep Reasoning Grammar Fix using {current_model} for {filename}"
             )
             print(f"  ✅ {filename} Successfully Uploaded!")
             if os.path.exists(temp_save_path): os.remove(temp_save_path)
