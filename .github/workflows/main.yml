@@ -1,3 +1,21 @@
+name: Audio Series Grammar Fixer
+
+on:
+  workflow_dispatch:
+
+jobs:
+  process_episodes:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          
       - name: Install Dependencies
         run: pip install groq huggingface_hub
         
@@ -5,5 +23,7 @@
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: python grammar_fixer.py
+        # DHYAN DEIN: Agar aapki python file ka naam 'main.py' hai, toh niche 'python main.py' hi rehne dein. 
+        # Agar file ka naam 'grammar_fixer.py' hai, toh ise badal kar 'python grammar_fixer.py' kar dein.
+        run: python main.py
         
