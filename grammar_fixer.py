@@ -1,41 +1,31 @@
 import os
 import time
 import re
-from google import genai
-from google.genai import types
+from groq import Groq
 from huggingface_hub import HfApi, hf_hub_download
 
 # ==========================================
 # 1. SETUP & SECRETS
 # ==========================================
-KEYS = [
-    os.environ.get("GEMINI_KEY_1", "").strip(),
-    os.environ.get("GEMINI_KEY_2", "").strip(),
-    os.environ.get("GEMINI_KEY_3", "").strip()
-]
-KEYS = [k for k in KEYS if k] 
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
 
-if not HF_TOKEN or not KEYS:
-    print("❌ ERROR: HF_TOKEN ya Gemini Keys GitHub Secrets mein missing hain!")
+if not HF_TOKEN or not GROQ_API_KEY:
+    print("❌ ERROR: HF_TOKEN ya GROQ_API_KEY GitHub Secrets mein missing hain!")
     exit(1)
 
 REPO_ID = "Kumarverma11/PocketFM_Audio"
 SOURCE_FOLDER = "Transcripts_Episode_0001_to_0200"
 TARGET_FOLDER = "Studio_Grammar_Corrected_Deep_Reasoning" 
-MODEL_ID = 'gemini-3.1-flash-lite'
+
+# Groq ka sabse powerful reasoning model
+MODEL_ID = 'llama3-70b-8192' 
 
 hf_api = HfApi()
-
-current_key_idx = 0
-def get_next_client():
-    global current_key_idx
-    client = genai.Client(api_key=KEYS[current_key_idx])
-    current_key_idx = (current_key_idx + 1) % len(KEYS)
-    return client
+client = Groq(api_key=GROQ_API_KEY)
 
 # ==========================================
-# 2. DEEP REASONING PROMPT & SAFE CONFIG
+# 2. DEEP REASONING PROMPT
 # ==========================================
 system_prompt = """
 Tum ek Master Hindi Copy Editor aur Proofreader ho. Tumhare paas "Deep Reasoning" aur "High Thinking" ki kshamata hai.
@@ -54,16 +44,6 @@ STRICT RULES:
 - TUMHE HAR HAAL MEIN PURA TEXT WAPAS DENA HAI. EMPTY RESPONSE MAT DENA.
 """
 
-safe_config = types.GenerateContentConfig(
-    temperature=0.2, 
-    safety_settings=[
-        types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold=types.HarmBlockThreshold.BLOCK_NONE),
-        types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HARASSMENT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
-        types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
-        types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
-    ]
-)
-
 # ==========================================
 # 3. ZIDDI AUTO-LOOP (SELF-HEALING ARCHITECTURE)
 # ==========================================
@@ -71,14 +51,14 @@ expected_eps = set(range(1, 201))
 confirmation_count = 0
 TARGET_CONFIRMATIONS = 3
 pass_count = 1
-MAX_PASSES = 25 # Loop tab tak chalega jab tak kaam khatam na ho (limit 25 ki hai taaki server hang na ho)
+MAX_PASSES = 20 # Loop limit
 
 while pass_count <= MAX_PASSES:
     print(f"\n{'='*60}")
     print(f"🔄 --- LOOP PASS {pass_count} : HUGGING FACE SCANNING ---")
     print(f"{'='*60}\n")
     
-    # 1. Hugging Face ko scan karna
+    # 1. Hugging Face Scan
     try:
         all_files = hf_api.list_repo_files(repo_id=REPO_ID, repo_type="dataset")
     except Exception as e:
@@ -101,24 +81,24 @@ while pass_count <= MAX_PASSES:
         print(f"✅ CONFIRMATION {confirmation_count}/{TARGET_CONFIRMATIONS} SUCCESS: 200/200 Episodes mil gaye!")
         
         if confirmation_count >= TARGET_CONFIRMATIONS:
-            print("\n🎉 MISSION 100% ACCOMPLISHED! Teeno confirmations pass ho gaye. Ab script chain ki saans le rahi hai. BINGE-WORTHY series ready hai!")
+            print("\n🎉 MISSION 100% ACCOMPLISHED! Teeno confirmations pass ho gaye. Groq ne saara kaam nipta diya!")
             exit(0)
         else:
-            print("⏳ Agli confirmation ke liye 15 seconds wait kar rahe hain...")
-            time.sleep(15)
+            print("⏳ Agli confirmation ke liye 10 seconds wait kar rahe hain...")
+            time.sleep(10)
             continue
     else:
-        confirmation_count = 0 # Agar ek bhi missing mil gaya, toh confirmation reset ho jayegi
+        confirmation_count = 0 
         
     print(f"⚠️ {len(missing_eps)} Episodes abhi bhi bache hain: {missing_eps}")
-    print("🚀 Firse shuru karte hain...\n")
+    print("🚀 Groq Model ke sath process shuru kar rahe hain...\n")
     
     # 3. MISSING EPISODES PROCESSING
     for idx, ep in enumerate(missing_eps):
         filename = f"Episode_{ep:04d}.txt"
         source_path = f"{SOURCE_FOLDER}/{filename}"
         
-        print(f"[{idx+1}/{len(missing_eps)}] Theek kiya jaa raha hai: {filename}...")
+        print(f"[{idx+1}/{len(missing_eps)}] Groq Theek kar raha hai: {filename}...")
         
         try:
             local_path = hf_hub_download(repo_id=REPO_ID, filename=source_path, repo_type="dataset", token=HF_TOKEN)
@@ -127,27 +107,24 @@ while pass_count <= MAX_PASSES:
                 
             fixed_text = None
             
-            # API Retries (4 koshish karega har file par)
+            # API Retries for Groq
             for attempt in range(4):
                 try:
-                    client = get_next_client()
-                    response = client.models.generate_content(
+                    completion = client.chat.completions.create(
                         model=MODEL_ID,
-                        contents=f"{system_prompt}\n\nTEXT:\n{raw_text}",
-                        config=safe_config
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": f"TEXT:\n{raw_text}"}
+                        ],
+                        temperature=0.2,
                     )
                     
-                    try:
-                        text = response.text
-                        if text:
-                            fixed_text = text.strip()
-                            break 
-                    except Exception as e:
-                        reason = response.candidates[0].finish_reason if response.candidates else "Unknown Block/Error"
-                        print(f"  ⚠️ Attempt {attempt+1} Blocked/Failed ({reason}). Retrying...")
-                        time.sleep(5) 
+                    text = completion.choices[0].message.content
+                    if text:
+                        fixed_text = text.strip()
+                        break 
                 except Exception as api_e:
-                    print(f"  ⚠️ Attempt {attempt+1} API Network Error: {api_e}. Retrying...")
+                    print(f"  ⚠️ Attempt {attempt+1} Groq API Error: {api_e}. Retrying...")
                     time.sleep(5)
             
             if not fixed_text:
@@ -167,7 +144,7 @@ while pass_count <= MAX_PASSES:
                 repo_id=REPO_ID,
                 repo_type="dataset",
                 token=HF_TOKEN,
-                commit_message=f"Auto-Loop Grammar Fix for {filename}"
+                commit_message=f"Groq Reasoning Grammar Fix for {filename}"
             )
             print(f"  ✅ {filename} Successfully Uploaded!")
             if os.path.exists(temp_save_path): os.remove(temp_save_path)
@@ -175,10 +152,12 @@ while pass_count <= MAX_PASSES:
         except Exception as e:
             print(f"❌ System Error on {filename}: {e}")
             
-        time.sleep(2) # Safe zone
+        # Groq Rate Limit Protection (Very Important)
+        time.sleep(4) 
         
-    print(f"\n⏳ Loop {pass_count} pura hua. API server ko saans lene ke liye 30 second de rahe hain...")
-    time.sleep(30) # Uploaded files index hone ke liye lamba wait
+    print(f"\n⏳ Loop {pass_count} pura hua. HF Update ke liye 30 second wait kar rahe hain...")
+    time.sleep(30)
     pass_count += 1
 
-print("\n🚨 SCRIPT STOPPED: Max 25 passes poore ho gaye hain par files abhi bhi bachi hain. Logs check karein.")
+print("\n🚨 SCRIPT STOPPED: Max passes poore ho gaye hain.")
+            
