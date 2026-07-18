@@ -1,5 +1,3 @@
-!pip install google-genai huggingface_hub -q
-
 import os
 import time
 import re
@@ -8,19 +6,18 @@ from google.genai import types
 from huggingface_hub import HfApi, hf_hub_download
 
 # ==========================================
-# 1. SETUP & SECRETS (Yahan Apni Keys Daalein)
+# 1. SETUP & SECRETS (From GitHub Secrets)
 # ==========================================
 KEYS = [
-    "YOUR_GEMINI_KEY_1",  # Yahan apni pehli key daalein
-    "YOUR_GEMINI_KEY_2",  # Yahan apni dusri key daalein
-    "YOUR_GEMINI_KEY_3"   # Yahan apni teesri key daalein
+    os.environ.get("GEMINI_KEY_1", "").strip(),
+    os.environ.get("GEMINI_KEY_2", "").strip(),
+    os.environ.get("GEMINI_KEY_3", "").strip()
 ]
-KEYS = [k.strip() for k in KEYS if k.strip() and "YOUR_" not in k]
+KEYS = [k for k in KEYS if k] 
+HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
 
-HF_TOKEN = "YOUR_HUGGINGFACE_WRITE_TOKEN" # Yahan apna HF Token daalein
-
-if not HF_TOKEN or "YOUR_" in HF_TOKEN or not KEYS:
-    print("❌ ERROR: Kripya code mein apni Gemini Keys aur HF Token sahi se paste karein!")
+if not HF_TOKEN or not KEYS:
+    print("❌ ERROR: HF_TOKEN ya Gemini Keys GitHub Secrets mein missing hain!")
     exit(1)
 
 REPO_ID = "Kumarverma11/PocketFM_Audio"
@@ -100,14 +97,12 @@ for idx, ep in enumerate(missing_eps):
                     config=safe_config
                 )
                 
-                # Check if text is successfully generated
                 try:
                     text = response.text
                     if text:
                         fixed_text = text.strip()
                         break 
                 except Exception as e:
-                    # Agar API block karti hai toh exact reason print karega
                     reason = response.candidates[0].finish_reason if response.candidates else "Unknown Block"
                     print(f"  ⚠️ Attempt {attempt+1} Blocked. Reason: {reason}. Retrying...")
                     time.sleep(3)
@@ -138,11 +133,12 @@ for idx, ep in enumerate(missing_eps):
             commit_message=f"Deep Reasoning Grammar Fix for missing {filename}"
         )
         print(f"  ✅ {filename} fixed & uploaded successfully!")
-        os.remove(temp_save_path)
+        if os.path.exists(temp_save_path):
+            os.remove(temp_save_path)
         
     except Exception as e:
         print(f"❌ Download/System Error on {filename}: {e}")
         
-    time.sleep(2) # 2 sec delay taaki rate limit cross na ho
+    time.sleep(1.5) # 1.5 sec delay taaki rate limit cross na ho
 
 print("\n🎉 Mission Accomplished! Saare bache hue episodes process ho gaye hain.")
