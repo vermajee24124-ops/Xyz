@@ -6,7 +6,7 @@ from google.genai import types
 from huggingface_hub import HfApi, hf_hub_download
 
 # ==========================================
-# 1. SETUP & SECRETS (From GitHub Secrets)
+# 1. SETUP & SECRETS
 # ==========================================
 KEYS = [
     os.environ.get("GEMINI_KEY_1", "").strip(),
@@ -35,14 +35,7 @@ def get_next_client():
     return client
 
 # ==========================================
-# 2. THE MISSING EPISODES LIST
-# ==========================================
-missing_eps = [1, 3, 8, 9, 23, 24, 25, 28, 29, 30, 35, 42, 46, 51, 55, 62, 64, 68, 75, 79, 80, 81, 83, 84, 85, 88, 89, 91, 94, 97, 100, 113, 121, 123, 125, 129, 134, 135, 140, 141, 144, 146, 149, 156, 158, 160, 162, 170, 173, 175, 180, 182, 189, 193, 194, 195, 196, 197]
-
-print(f"🚀 Sirf bache hue {len(missing_eps)} episodes ko process karna shuru kar rahe hain...\n")
-
-# ==========================================
-# 3. DEEP REASONING PROMPT & SAFE CONFIG
+# 2. DEEP REASONING PROMPT & SAFE CONFIG
 # ==========================================
 system_prompt = """
 Tum ek Master Hindi Copy Editor aur Proofreader ho. Tumhare paas "Deep Reasoning" aur "High Thinking" ki kshamata hai.
@@ -72,73 +65,106 @@ safe_config = types.GenerateContentConfig(
 )
 
 # ==========================================
-# 4. PROCESS ONLY MISSING EPISODES
+# 3. AUTO-VALIDATION & PROCESSING LOOP
 # ==========================================
-for idx, ep in enumerate(missing_eps):
-    filename = f"Episode_{ep:04d}.txt"
-    source_path = f"{SOURCE_FOLDER}/{filename}"
-    
-    print(f"[{idx+1}/{len(missing_eps)}] Downloading & Processing {filename}...")
-    
-    try:
-        local_path = hf_hub_download(repo_id=REPO_ID, filename=source_path, repo_type="dataset", token=HF_TOKEN)
-        with open(local_path, 'r', encoding='utf-8') as f:
-            raw_text = f.read()
-            
-        fixed_text = None
-        
-        # 3 Retry Auto-Fallback (To combat Empty Responses)
-        for attempt in range(3):
-            try:
-                client = get_next_client()
-                response = client.models.generate_content(
-                    model=MODEL_ID,
-                    contents=f"{system_prompt}\n\nTEXT:\n{raw_text}",
-                    config=safe_config
-                )
-                
-                try:
-                    text = response.text
-                    if text:
-                        fixed_text = text.strip()
-                        break 
-                except Exception as e:
-                    reason = response.candidates[0].finish_reason if response.candidates else "Unknown Block"
-                    print(f"  ⚠️ Attempt {attempt+1} Blocked. Reason: {reason}. Retrying...")
-                    time.sleep(3)
-                    
-            except Exception as api_e:
-                print(f"  ⚠️ Attempt {attempt+1} API Error: {api_e}. Retrying...")
-                time.sleep(3)
-        
-        if not fixed_text:
-            print(f"❌ {filename} 3 attempts ke baad bhi fail ho gaya. Isko manual dekhna padega.")
-            continue
-            
-        # Extra AI text cleanup
-        fixed_text = re.sub(r'^(यहाँ आपका टेक्स्ट.*?है:?\s*)', '', fixed_text, flags=re.IGNORECASE)
-            
-        # Save locally
-        temp_save_path = f"./{filename}"
-        with open(temp_save_path, 'w', encoding='utf-8') as f:
-            f.write(fixed_text)
-            
-        # Upload
-        hf_api.upload_file(
-            path_or_fileobj=temp_save_path,
-            path_in_repo=f"{TARGET_FOLDER}/{filename}",
-            repo_id=REPO_ID,
-            repo_type="dataset",
-            token=HF_TOKEN,
-            commit_message=f"Deep Reasoning Grammar Fix for missing {filename}"
-        )
-        print(f"  ✅ {filename} fixed & uploaded successfully!")
-        if os.path.exists(temp_save_path):
-            os.remove(temp_save_path)
-        
-    except Exception as e:
-        print(f"❌ Download/System Error on {filename}: {e}")
-        
-    time.sleep(1.5) # 1.5 sec delay taaki rate limit cross na ho
+MAX_PASSES = 5 # Code maximum 5 baar ghoom kar verify karega
+expected_eps = set(range(1, 201))
 
-print("\n🎉 Mission Accomplished! Saare bache hue episodes process ho gaye hain.")
+for pass_num in range(1, MAX_PASSES + 1):
+    print(f"\n{'='*50}")
+    print(f"🔄 --- PASS {pass_num} / {MAX_PASSES} : HUGGING FACE SCANNING ---")
+    print(f"{'='*50}\n")
+    
+    # 1. Hugging Face ko scan karna
+    try:
+        all_files = hf_api.list_repo_files(repo_id=REPO_ID, repo_type="dataset")
+    except Exception as e:
+        print(f"❌ HF Scan Error: {e}. Retrying pass...")
+        time.sleep(10)
+        continue
+
+    target_eps = set()
+    for f in all_files:
+        if f.startswith(f"{TARGET_FOLDER}/Episode_"):
+            match = re.search(r'Episode_(\d{4})\.txt', f)
+            if match: 
+                target_eps.add(int(match.group(1)))
+
+    missing_eps = sorted(list(expected_eps - target_eps))
+    
+    if not missing_eps:
+        print("🎉 BADHAI HO! 100% (200/200) Episodes successfully fix aur upload ho chuke hain! Mission Complete!")
+        exit(0) # Loop aur code yahan successfully band ho jayega
+        
+    print(f"⚠️ {len(missing_eps)} Episodes bache hain: {missing_eps}")
+    print("🚀 Inko theek karna shuru kar rahe hain...\n")
+    
+    # 2. Missing Episodes ko Process karna
+    for idx, ep in enumerate(missing_eps):
+        filename = f"Episode_{ep:04d}.txt"
+        source_path = f"{SOURCE_FOLDER}/{filename}"
+        
+        print(f"[{idx+1}/{len(missing_eps)}] Processing {filename}...")
+        
+        try:
+            local_path = hf_hub_download(repo_id=REPO_ID, filename=source_path, repo_type="dataset", token=HF_TOKEN)
+            with open(local_path, 'r', encoding='utf-8') as f:
+                raw_text = f.read()
+                
+            fixed_text = None
+            
+            # API Retries
+            for attempt in range(3):
+                try:
+                    client = get_next_client()
+                    response = client.models.generate_content(
+                        model=MODEL_ID,
+                        contents=f"{system_prompt}\n\nTEXT:\n{raw_text}",
+                        config=safe_config
+                    )
+                    
+                    try:
+                        text = response.text
+                        if text:
+                            fixed_text = text.strip()
+                            break 
+                    except Exception as e:
+                        reason = response.candidates[0].finish_reason if response.candidates else "Unknown"
+                        print(f"  ⚠️ Attempt {attempt+1} Blocked ({reason}). Retrying...")
+                        time.sleep(5) # Timeout badha diya hai
+                except Exception as api_e:
+                    print(f"  ⚠️ Attempt {attempt+1} API Error: {api_e}. Retrying...")
+                    time.sleep(5)
+            
+            if not fixed_text:
+                print(f"❌ {filename} fail ho gaya. Next pass mein dobara check hoga.")
+                continue
+                
+            # Extra text hata dena
+            fixed_text = re.sub(r'^(यहाँ आपका टेक्स्ट.*?है:?\s*)', '', fixed_text, flags=re.IGNORECASE)
+                
+            temp_save_path = f"./{filename}"
+            with open(temp_save_path, 'w', encoding='utf-8') as f:
+                f.write(fixed_text)
+                
+            hf_api.upload_file(
+                path_or_fileobj=temp_save_path,
+                path_in_repo=f"{TARGET_FOLDER}/{filename}",
+                repo_id=REPO_ID,
+                repo_type="dataset",
+                token=HF_TOKEN,
+                commit_message=f"Deep Reasoning Grammar Fix for {filename}"
+            )
+            print(f"  ✅ {filename} fixed & uploaded!")
+            if os.path.exists(temp_save_path): os.remove(temp_save_path)
+            
+        except Exception as e:
+            print(f"❌ Error on {filename}: {e}")
+            
+        time.sleep(2) # API Rate Limit safe zone
+        
+    print(f"\n⏳ Pass {pass_num} processing khatam. Agle pass mein wapas HF ko verify karenge...")
+    time.sleep(10) # Repo ko update hone ka time dene ke liye thoda wait
+
+print(f"\n🚨 Max {MAX_PASSES} Passes pure ho gaye. Code band ho raha hai. Ek baar logs check kar lijiye.")
+    
