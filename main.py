@@ -12,6 +12,12 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 from huggingface_hub import CommitOperationAdd, HfApi, hf_hub_download
 
+# Remove invisible formatting marks that can break API auth headers or prompts.
+_INVISIBLE_RE = re.compile(r"[\u200e\u200f\u202a-\u202e\u2066-\u2069\uFEFF]")
+def strip_invisible(value: str) -> str:
+    return _INVISIBLE_RE.sub("", value).strip()
+
+
 # Public GitHub safe workflow:
 # - code stays in GitHub
 # - cleaned transcript + analysis go directly to Hugging Face
@@ -21,7 +27,7 @@ HF_REPO = "Kumarverma11/PocketFM_Audio"
 HF_TYPE = "dataset"
 
 SOURCE_FOLDER = "Transcripts_Episode_0001_to_0200"
-OUTPUT_FOLDER = "Veda_Final_Training_Export_0001_to_0200"
+OUTPUT_FOLDER = "Veda_Training_Ready_FINAL_0001_to_0200"
 
 TRACK_A_FOLDER = f"{OUTPUT_FOLDER}/TRACK_A_CLEAN_EPISODES"
 TRACK_B_FOLDER = f"{OUTPUT_FOLDER}/TRACK_B_STORY_INTELLIGENCE"
@@ -55,7 +61,7 @@ for p in (RAW_DIR, CLEAN_DIR, INTEL_DIR, STATE_DIR):
 
 
 def secret(name: str) -> str:
-    value = os.getenv(name, "").strip()
+    value = strip_invisible(os.getenv(name, ""))
     if not value:
         raise RuntimeError(f"Missing GitHub secret: {name}")
     return value
@@ -69,7 +75,7 @@ http = requests.Session()
 
 
 def normalize_text(text: str) -> str:
-    text = unicodedata.normalize("NFC", text).replace("\ufeff", "")
+    text = strip_invisible(unicodedata.normalize("NFC", text).replace("\ufeff", ""))
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r" *\n *", "\n", text)
@@ -171,7 +177,7 @@ def call_nvidia(
         "Content-Type": "application/json",
     }
     payload: Dict[str, Any] = {
-        "model": model,
+        "model": strip_invisible(model),
         "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
@@ -272,12 +278,12 @@ def safe_text(prompt: str, model: str, max_tokens: int, thinking: bool = False) 
         messages=[
             {
                 "role": "system",
-                "content": (
+                "content": strip_invisible(
                     "You are a careful transcript editor for a fictional Hindi drama. "
                     "Preserve the original story, do not invent new events, and output only the requested text."
                 ),
             },
-            {"role": "user", "content": prompt},
+            {"role": "user", "content": strip_invisible(prompt)},
         ],
         max_tokens=max_tokens,
         temperature=0.1,
@@ -297,12 +303,12 @@ def safe_json(prompt: str, model: str, max_tokens: int, thinking: bool = True) -
         messages=[
             {
                 "role": "system",
-                "content": (
+                "content": strip_invisible(
                     "You are a continuity analyst for a fictional Hindi drama. "
                     "Use only transcript-supported facts. Return valid JSON only."
                 ),
             },
-            {"role": "user", "content": prompt},
+            {"role": "user", "content": strip_invisible(prompt)},
         ],
         max_tokens=max_tokens,
         temperature=0.1,
