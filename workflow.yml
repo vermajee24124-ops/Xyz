@@ -1,4 +1,4 @@
-name: Veda Final Verified Builder
+name: Veda Final Auto-Fallback Builder
 
 on:
   workflow_dispatch:
@@ -7,7 +7,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: veda-final-verified-builder
+  group: veda-final-auto-fallback-builder
   cancel-in-progress: false
 
 jobs:

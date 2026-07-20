@@ -12,35 +12,30 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 from huggingface_hub import CommitOperationAdd, HfApi, hf_hub_download
 
-# Remove invisible formatting marks that can break API auth headers or prompts.
-_INVISIBLE_RE = re.compile(r"[\u200e\u200f\u202a-\u202e\u2066-\u2069\uFEFF]")
-def strip_invisible(value: str) -> str:
-    return _INVISIBLE_RE.sub("", value).strip()
-
-
-# Public GitHub safe workflow:
-# - code stays in GitHub
-# - cleaned transcript + analysis go directly to Hugging Face
-# - nothing sensitive is committed to GitHub
-
 HF_REPO = "Kumarverma11/PocketFM_Audio"
 HF_TYPE = "dataset"
 
 SOURCE_FOLDER = "Transcripts_Episode_0001_to_0200"
-OUTPUT_FOLDER = "Veda_Training_Ready_FINAL_0001_to_0200"
+EXPORT_FOLDER = "Veda_Final_Training_Export_0001_to_0200"
 
-TRACK_A_FOLDER = f"{OUTPUT_FOLDER}/TRACK_A_CLEAN_EPISODES"
-TRACK_B_FOLDER = f"{OUTPUT_FOLDER}/TRACK_B_STORY_INTELLIGENCE"
-DATASETS_FOLDER = f"{OUTPUT_FOLDER}/TRAINING_DATASETS"
-STATE_FOLDER = f"{OUTPUT_FOLDER}/STATE"
+TRACK_A_FOLDER = f"{EXPORT_FOLDER}/TRACK_A_CLEAN_EPISODES"
+TRACK_B_FOLDER = f"{EXPORT_FOLDER}/TRACK_B_STORY_INTELLIGENCE"
+DATASETS_FOLDER = f"{EXPORT_FOLDER}/TRAINING_DATASETS"
+STATE_FOLDER = f"{EXPORT_FOLDER}/STATE"
 
 BATCH_SIZE = 20
 REQUEST_DELAY_SECONDS = 1.0
 MAX_RETRIES = 4
 
-# Verified NVIDIA Build free-endpoint models.
-CLEAN_MODEL = "deepseek-ai/deepseek-v4-pro"
-ANALYSIS_MODEL = "nvidia/nemotron-3-ultra-550b-a55b"
+CLEAN_MODELS = [
+    "deepseek-ai/deepseek-v4-pro",
+    "qwen/qwen3.5-122b-a10b",
+]
+ANALYSIS_MODELS = [
+    "deepseek-ai/deepseek-v4-pro",
+    "qwen/qwen3.5-122b-a10b",
+]
+
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 
 MERGED_RANGES = (
@@ -51,13 +46,20 @@ MERGED_RANGES = (
     (140, 143),
 )
 
-WORK = Path("/tmp/veda_public_safe_final")
+WORK = Path("/tmp/veda_auto_fallback")
 RAW_DIR = WORK / "raw"
 CLEAN_DIR = WORK / "clean"
 INTEL_DIR = WORK / "intel"
 STATE_DIR = WORK / "state"
 for p in (RAW_DIR, CLEAN_DIR, INTEL_DIR, STATE_DIR):
     p.mkdir(parents=True, exist_ok=True)
+
+
+def strip_invisible(text: str) -> str:
+    text = text.replace("\ufeff", "")
+    text = re.sub(r"[\u200e\u200f\u202a-\u202e\u2066-\u2069]", "", text)
+    text = "".join(ch for ch in text if unicodedata.category(ch)[0] != "C")
+    return text.strip()
 
 
 def secret(name: str) -> str:
@@ -75,7 +77,7 @@ http = requests.Session()
 
 
 def normalize_text(text: str) -> str:
-    text = strip_invisible(unicodedata.normalize("NFC", text).replace("\ufeff", ""))
+    text = unicodedata.normalize("NFC", text).replace("\ufeff", "")
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r" *\n *", "\n", text)
@@ -96,7 +98,6 @@ def in_merged_range(n: int) -> bool:
 def list_source_paths() -> Dict[int, str]:
     prefix = f"{SOURCE_FOLDER}/"
     result: Dict[int, str] = {}
-
     for item in api.list_repo_tree(HF_REPO, repo_type=HF_TYPE, recursive=True):
         path = getattr(item, "path", "")
         if not (path.startswith(prefix) and path.lower().endswith(".txt")):
@@ -106,11 +107,9 @@ def list_source_paths() -> Dict[int, str]:
             if ep in result:
                 raise RuntimeError(f"Duplicate source episode {ep}: {result[ep]} AND {path}")
             result[ep] = path
-
     missing = [n for n in range(1, 201) if n not in result]
     if missing:
         raise RuntimeError(f"Missing source episodes: {missing}")
-
     return result
 
 
@@ -168,8 +167,7 @@ def call_nvidia(
     messages: List[Dict[str, Any]],
     max_tokens: int,
     temperature: float = 0.1,
-    enable_thinking: bool = False,
-    reasoning_budget: Optional[int] = None,
+    thinking: bool = False,
     retries: int = MAX_RETRIES,
 ) -> Dict[str, Any]:
     headers = {
@@ -177,23 +175,21 @@ def call_nvidia(
         "Content-Type": "application/json",
     }
     payload: Dict[str, Any] = {
-        "model": strip_invisible(model),
+        "model": model,
         "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
         "stream": False,
     }
-    if enable_thinking:
-        extra_body: Dict[str, Any] = {"chat_template_kwargs": {"enable_thinking": True}}
-        if reasoning_budget is not None:
-            extra_body["reasoning_budget"] = reasoning_budget
-        payload["extra_body"] = extra_body
+    if thinking:
+        payload["extra_body"] = {"chat_template_kwargs": {"enable_thinking": True}}
 
     last_error = ""
-
     for attempt in range(1, retries + 1):
         try:
             response = http.post(NVIDIA_BASE_URL, headers=headers, json=payload, timeout=(30, 900))
+            if response.status_code in (401, 403, 404):
+                raise PermissionError(f"HTTP {response.status_code}: {response.text[:1200]}")
             if response.status_code in (429, 500, 502, 503, 504):
                 wait = parse_wait(
                     response.headers.get("retry-after")
@@ -205,10 +201,10 @@ def call_nvidia(
                 print(f"{model}: HTTP {response.status_code}, retry in {wait:.1f}s")
                 time.sleep(wait)
                 continue
-
             response.raise_for_status()
             return response.json()
-
+        except PermissionError:
+            raise
         except Exception as exc:
             last_error = str(exc)
             if attempt < retries:
@@ -216,9 +212,6 @@ def call_nvidia(
                 print(f"{model}: error on attempt {attempt}/{retries}: {exc}")
                 print(f"{model}: retry in {wait:.1f}s")
                 time.sleep(wait)
-            else:
-                break
-
     raise RuntimeError(f"{model} failed after retries: {last_error}")
 
 
@@ -227,7 +220,6 @@ def extract_message_text(data: Dict[str, Any]) -> str:
     if not choices:
         return ""
     message = choices[0].get("message") or {}
-
     pieces: List[str] = []
     for key in ("content", "reasoning_content", "reasoning"):
         value = message.get(key)
@@ -241,7 +233,6 @@ def extract_message_text(data: Dict[str, Any]) -> str:
                     txt = part.get("text") or part.get("content")
                     if isinstance(txt, str) and txt.strip():
                         pieces.append(txt.strip())
-
     return "\n".join(pieces).strip()
 
 
@@ -249,12 +240,10 @@ def extract_json_object(text: str) -> Dict[str, Any]:
     text = text.strip()
     text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
     text = re.sub(r"\s*```$", "", text)
-
     try:
         return json.loads(text)
     except Exception:
         pass
-
     decoder = json.JSONDecoder()
     found: List[Dict[str, Any]] = []
     for i, ch in enumerate(text):
@@ -265,61 +254,42 @@ def extract_json_object(text: str) -> Dict[str, Any]:
                     found.append(obj)
             except Exception:
                 pass
-
     if found:
         return found[-1]
-
     raise ValueError("No valid JSON object found")
 
 
-def safe_text(prompt: str, model: str, max_tokens: int, thinking: bool = False) -> str:
-    data = call_nvidia(
-        model=model,
-        messages=[
-            {
-                "role": "system",
-                "content": strip_invisible(
-                    "You are a careful transcript editor for a fictional Hindi drama. "
-                    "Preserve the original story, do not invent new events, and output only the requested text."
-                ),
-            },
-            {"role": "user", "content": strip_invisible(prompt)},
-        ],
-        max_tokens=max_tokens,
-        temperature=0.1,
-        enable_thinking=thinking,
-        reasoning_budget=max_tokens if thinking else None,
-        retries=MAX_RETRIES,
-    )
-    text = extract_message_text(data)
-    if not text:
-        raise RuntimeError(f"{model} returned empty text")
-    return text.strip()
-
-
-def safe_json(prompt: str, model: str, max_tokens: int, thinking: bool = True) -> Dict[str, Any]:
-    data = call_nvidia(
-        model=model,
-        messages=[
-            {
-                "role": "system",
-                "content": strip_invisible(
-                    "You are a continuity analyst for a fictional Hindi drama. "
-                    "Use only transcript-supported facts. Return valid JSON only."
-                ),
-            },
-            {"role": "user", "content": strip_invisible(prompt)},
-        ],
-        max_tokens=max_tokens,
-        temperature=0.1,
-        enable_thinking=thinking,
-        reasoning_budget=max_tokens if thinking else None,
-        retries=MAX_RETRIES,
-    )
-    text = extract_message_text(data)
-    if not text:
-        raise RuntimeError(f"{model} returned empty JSON text")
-    return extract_json_object(text)
+def call_model_chain(
+    models: List[str],
+    messages: List[Dict[str, Any]],
+    max_tokens: int,
+    temperature: float = 0.1,
+    thinking: bool = False,
+    is_json: bool = False,
+) -> str | Dict[str, Any]:
+    last_error = ""
+    for model in models:
+        try:
+            data = call_nvidia(
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                thinking=thinking,
+            )
+            text = extract_message_text(data)
+            if not text:
+                raise RuntimeError(f"{model} returned empty response")
+            if is_json:
+                return extract_json_object(text)
+            return text.strip()
+        except PermissionError as exc:
+            last_error = str(exc)
+            print(f"{model}: forbidden, switching to next model")
+        except Exception as exc:
+            last_error = str(exc)
+            print(f"{model}: failed: {exc}")
+    raise RuntimeError(f"All models failed: {last_error}")
 
 
 def clean_prompt(ep: int, current: str, prev_text: str, next_text: str) -> str:
@@ -328,12 +298,11 @@ def clean_prompt(ep: int, current: str, prev_text: str, next_text: str) -> str:
             f"\nMerged-range repair mode is active for episode {ep}.\n"
             "Check only for overlap, duplicated lines, and sentences cut at the boundary.\n"
             "Do not rewrite the story, do not summarize, and do not add new dialogue.\n"
-            f"PREVIOUS EPISODE END:\n{prev_text[-1800:]}\n"
-            f"NEXT EPISODE START:\n{next_text[:1800]}\n"
+            f"PREVIOUS EPISODE END:\n{prev_text[-1500:]}\n"
+            f"NEXT EPISODE START:\n{next_text[:1500]}\n"
         )
     else:
         boundary = "\nNormal clean mode. Do not change episode boundaries.\n"
-
     return (
         "This is a fictional Hindi drama transcript.\n"
         "Fix only ASR mistakes, Hindi grammar, spelling, punctuation, spacing, and obvious character-name errors.\n"
@@ -344,36 +313,10 @@ def clean_prompt(ep: int, current: str, prev_text: str, next_text: str) -> str:
     )
 
 
-def boundary_repair(ep: int, prev_clean: str, current_clean: str, next_clean: str) -> Tuple[str, str]:
-    prompt = (
-        f"Episode {ep-1} and Episode {ep} are from a split merged audio file.\n"
-        "Repair only the boundary overlap or cut sentence.\n"
-        "Return valid JSON only with keys left_tail, right_head, changed.\n"
-        "Do not add new content.\n"
-        f"LEFT EPISODE TAIL:\n{prev_clean[-1400:]}\n"
-        f"RIGHT EPISODE HEAD:\n{current_clean[:1400]}"
-    )
-
-    obj = safe_json(prompt, CLEAN_MODEL, max_tokens=2200, thinking=False)
-    left_tail = str(obj.get("left_tail", "")).strip()
-    right_head = str(obj.get("right_head", "")).strip()
-
-    if not left_tail or not right_head:
-        raise RuntimeError("Boundary repair JSON missing left_tail/right_head")
-
-    new_prev = prev_clean[:-min(len(prev_clean), 1400)] + left_tail if prev_clean else left_tail
-    new_cur = right_head + current_clean[min(len(current_clean), 1400):] if current_clean else right_head
-    return new_prev, new_cur
-
-
 TRACK_B_SCHEMA = {
     "episode": 1,
     "story_summary": "",
-    "opening_state": {
-        "situation": "",
-        "active_problem": "",
-        "immediate_goal": "",
-    },
+    "opening_state": {"situation": "", "active_problem": "", "immediate_goal": ""},
     "character_states": [
         {
             "name": "",
@@ -386,58 +329,21 @@ TRACK_B_SCHEMA = {
         }
     ],
     "active_plot_threads": [
-        {
-            "thread": "",
-            "status": "opened",
-            "evidence": "",
-            "next_pressure": "",
-        }
+        {"thread": "", "status": "opened", "evidence": "", "next_pressure": ""}
     ],
     "conflicts": [
-        {
-            "type": "",
-            "characters": [],
-            "cause": "",
-            "development": "",
-            "result": "",
-        }
+        {"type": "", "characters": [], "cause": "", "development": "", "result": ""}
     ],
     "turning_points": [
-        {
-            "event": "",
-            "before": "",
-            "after": "",
-            "why_it_matters": "",
-        }
+        {"event": "", "before": "", "after": "", "why_it_matters": ""}
     ],
-    "setups": [
-        {
-            "setup": "",
-            "possible_payoff": "",
-            "status": "",
-        }
-    ],
-    "payoffs": [
-        {
-            "payoff": "",
-            "setup_reference": "",
-            "effect": "",
-        }
-    ],
+    "setups": [{"setup": "", "possible_payoff": "", "status": ""}],
+    "payoffs": [{"payoff": "", "setup_reference": "", "effect": ""}],
     "continuity_constraints": [
-        {
-            "fact": "",
-            "must_remain_true_until_changed": "",
-            "risk_if_ignored": "",
-        }
+        {"fact": "", "must_remain_true_until_changed": "", "risk_if_ignored": ""}
     ],
     "reveals_and_knowledge": [
-        {
-            "fact": "",
-            "known_by": [],
-            "unknown_to": [],
-            "effect": "",
-        }
+        {"fact": "", "known_by": [], "unknown_to": [], "effect": ""}
     ],
     "cliffhanger": {
         "type": "",
@@ -471,32 +377,14 @@ def track_b_prompt(ep: int, clean_text: str, memory: Dict[str, Any]) -> str:
         "- Use transcript-supported facts only.\n"
         "- If something is uncertain, keep it cautious or leave it empty.\n"
         "- Evidence should be short text snippets taken from the episode.\n"
+        "- Do not write the next story.\n"
     )
 
 
 def ensure_track_b_shape(obj: Dict[str, Any], ep: int) -> Dict[str, Any]:
     obj["episode"] = ep
-    for key in (
-        "story_summary",
-        "opening_state",
-        "character_states",
-        "active_plot_threads",
-        "conflicts",
-        "turning_points",
-        "setups",
-        "payoffs",
-        "continuity_constraints",
-        "reveals_and_knowledge",
-        "cliffhanger",
-        "next_episode_logic",
-        "timeline_delta",
-        "locations",
-        "objects_or_resources",
-        "continuity_memory_update",
-        "evidence",
-    ):
-        obj.setdefault(key, TRACK_B_SCHEMA[key])
-
+    for key, default in TRACK_B_SCHEMA.items():
+        obj.setdefault(key, default)
     return obj
 
 
@@ -513,7 +401,6 @@ def save_json(path: Path, obj: Dict[str, Any]) -> None:
 def rebuild_jsonl() -> Tuple[Path, Path]:
     track_a_jsonl = WORK / "track_a.jsonl"
     track_b_jsonl = WORK / "track_b.jsonl"
-
     with track_a_jsonl.open("w", encoding="utf-8") as fa, track_b_jsonl.open("w", encoding="utf-8") as fb:
         for ep in range(1, 201):
             a = CLEAN_DIR / f"Episode_{ep:04d}.txt"
@@ -522,7 +409,6 @@ def rebuild_jsonl() -> Tuple[Path, Path]:
                 fa.write(json.dumps({"episode": ep, "text": a.read_text(encoding="utf-8").strip()}, ensure_ascii=False) + "\n")
             if b.exists():
                 fb.write(json.dumps(json.loads(b.read_text(encoding="utf-8")), ensure_ascii=False) + "\n")
-
     return track_a_jsonl, track_b_jsonl
 
 
@@ -535,7 +421,6 @@ def upload_batch(batch_episodes: List[int], memory: Dict[str, Any]) -> None:
     for ep in batch_episodes:
         files[f"{TRACK_A_FOLDER}/Episode_{ep:04d}.txt"] = CLEAN_DIR / f"Episode_{ep:04d}.txt"
         files[f"{TRACK_B_FOLDER}/Episode_{ep:04d}.json"] = INTEL_DIR / f"Episode_{ep:04d}.json"
-
     files[f"{DATASETS_FOLDER}/track_a.jsonl"] = track_a_jsonl
     files[f"{DATASETS_FOLDER}/track_b.jsonl"] = track_b_jsonl
     files[f"{STATE_FOLDER}/story_memory.json"] = state_json
@@ -584,8 +469,8 @@ def main() -> None:
 
     print(f"PASS: source episodes 1-200 found in {SOURCE_FOLDER}")
     print(f"Remote already complete: {len(completed)}/200")
-    print(f"Cleaning model: {CLEAN_MODEL}")
-    print(f"Analysis model: {ANALYSIS_MODEL}")
+    print(f"Primary clean model: {CLEAN_MODELS[0]}")
+    print(f"Primary analysis model: {ANALYSIS_MODELS[0]}")
 
     memory: Dict[str, Any] = {}
     state_file = STATE_DIR / "story_memory.json"
@@ -605,21 +490,55 @@ def main() -> None:
 
         repo_path = source_paths[ep]
         raw_text = normalize_text(download_episode(repo_path))
-
         current_clean = raw_text
+
         if in_merged_range(ep):
             prev_text = prev_clean or ""
             next_text = ""
             if ep < 200 and (ep + 1) not in completed:
                 next_text = normalize_text(download_episode(source_paths[ep + 1]))
             prompt = clean_prompt(ep, raw_text, prev_text, next_text)
-            current_clean = safe_text(prompt, CLEAN_MODEL, max_tokens=5500, thinking=False)
+            current_clean = call_model_chain(
+                CLEAN_MODELS,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a careful transcript editor for a fictional Hindi drama. "
+                            "Do not invent new events. Return only corrected transcript text."
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=5500,
+                temperature=0.1,
+                thinking=False,
+                is_json=False,
+            )
+            current_clean = str(current_clean)
 
         current_clean = normalize_text(current_clean)
         save_text(CLEAN_DIR / f"Episode_{ep:04d}.txt", current_clean)
 
         intel_prompt = track_b_prompt(ep, current_clean, memory)
-        intel = safe_json(intel_prompt, ANALYSIS_MODEL, max_tokens=7000, thinking=True)
+        intel = call_model_chain(
+            ANALYSIS_MODELS,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a continuity analyst for a fictional Hindi drama. "
+                        "Use only transcript-supported facts. Return valid JSON only."
+                    ),
+                },
+                {"role": "user", "content": intel_prompt},
+            ],
+            max_tokens=7000,
+            temperature=0.1,
+            thinking=True,
+            is_json=True,
+        )
+        assert isinstance(intel, dict)
         intel = ensure_track_b_shape(intel, ep)
         save_json(INTEL_DIR / f"Episode_{ep:04d}.json", intel)
 
