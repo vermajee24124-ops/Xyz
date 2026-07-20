@@ -1,4 +1,4 @@
-name: Veda Final Auto-Detect Builder
+name: Veda Final Reference Builder
 
 on:
   workflow_dispatch:
@@ -7,7 +7,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: veda-final-auto-detect-builder
+  group: veda-final-reference-builder
   cancel-in-progress: false
 
 jobs:
