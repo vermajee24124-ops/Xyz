@@ -29,11 +29,11 @@ MAX_RETRIES = 4
 
 CLEAN_MODELS = [
     "deepseek-ai/deepseek-v4-pro",
-    "qwen/qwen3.5-122b-a10b",
+    "z-ai/glm-5.2",
 ]
 ANALYSIS_MODELS = [
     "deepseek-ai/deepseek-v4-pro",
-    "qwen/qwen3.5-122b-a10b",
+    "z-ai/glm-5.2",
 ]
 
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
