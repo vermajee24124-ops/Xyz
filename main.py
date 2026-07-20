@@ -40,15 +40,15 @@ NVIDIA_MODELS_URL = "https://integrate.api.nvidia.com/v1/models"
 
 # Auto-detect from /v1/models, then rank by this order.
 PREFERRED_CLEAN_MODELS = [
+    "nvidia/nemotron-3-ultra-550b-a55b",
     "deepseek-ai/deepseek-v4-pro",
     "z-ai/glm-5.2",
     "qwen/qwen3.5-122b-a10b",
-    "nvidia/nemotron-3-ultra-550b-a55b",
 ]
 PREFERRED_ANALYSIS_MODELS = [
     "nvidia/nemotron-3-ultra-550b-a55b",
-    "z-ai/glm-5.2",
     "deepseek-ai/deepseek-v4-pro",
+    "z-ai/glm-5.2",
     "qwen/qwen3.5-122b-a10b",
 ]
 
@@ -61,7 +61,7 @@ MERGED_RANGES = (
     (140, 143),
 )
 
-WORK = Path("/tmp/veda_auto_detect_verified")
+WORK = Path("/tmp/veda_auto_detect_fix")
 RAW_DIR = WORK / "raw"
 CLEAN_DIR = WORK / "clean"
 INTEL_DIR = WORK / "intel"
@@ -203,9 +203,12 @@ def call_nvidia(
         "stream": False,
     }
 
-    # Only Nemotron gets thinking enabled. Other models use a minimal, stable payload.
+    # Only Nemotron gets thinking enabled. Other models use a minimal payload.
     if thinking and model.startswith("nvidia/nemotron-3-ultra"):
-        payload["extra_body"] = {"chat_template_kwargs": {"enable_thinking": True}, "reasoning_budget": max_tokens}
+        payload["extra_body"] = {
+            "chat_template_kwargs": {"enable_thinking": True},
+            "reasoning_budget": max_tokens,
+        }
 
     last_error = ""
 
@@ -324,9 +327,9 @@ def preferred_available(preferred: List[str], available: List[str]) -> List[str]
             chosen.append(available_lower[p.lower()])
 
     if chosen:
-        return chosen
+        return list(dict.fromkeys(chosen))
 
-    # fallback by suffix match if exact id is not present
+    # Fallback by suffix match if exact id is not present.
     for p in preferred:
         ps = p.lower().split("/")[-1]
         for a in available:
@@ -396,7 +399,7 @@ def clean_prompt(ep: int, current: str, prev_text: str, next_text: str) -> str:
     )
 
 
-def TRACK_B_SCHEMA() -> Dict[str, Any]:
+def track_b_schema() -> Dict[str, Any]:
     return {
         "episode": 1,
         "story_summary": "",
@@ -454,7 +457,7 @@ def track_b_prompt(ep: int, clean_text: str, memory: Dict[str, Any]) -> str:
         f"Episode {ep} is a fictional Hindi drama.\n"
         "Extract ONLY facts supported by the transcript. Do not create the next episode, do not continue the story, and do not invent future canon.\n"
         "Return valid JSON that matches this schema exactly:\n"
-        f"{json.dumps(TRACK_B_SCHEMA(), ensure_ascii=False, indent=2)}\n\n"
+        f"{json.dumps(track_b_schema(), ensure_ascii=False, indent=2)}\n\n"
         f"PRIOR MEMORY:\n{json.dumps(memory, ensure_ascii=False)}\n\n"
         f"CLEAN EPISODE TEXT:\n{clean_text}\n\n"
         "Rules:\n"
@@ -467,7 +470,7 @@ def track_b_prompt(ep: int, clean_text: str, memory: Dict[str, Any]) -> str:
 
 def ensure_track_b_shape(obj: Dict[str, Any], ep: int) -> Dict[str, Any]:
     obj["episode"] = ep
-    for key, default in TRACK_B_SCHEMA().items():
+    for key, default in track_b_schema().items():
         obj.setdefault(key, default)
     return obj
 
@@ -553,9 +556,14 @@ def update_memory(memory: Dict[str, Any], intel: Dict[str, Any], ep: int) -> Dic
 def main() -> None:
     source_paths = list_source_paths()
     completed = remote_completed()
+
     available_models = model_list()
-    clean_models = preferred_available(PREFERRED_CLEAN_MODELS, available_models) or PREFERRED_CLEAN_MODELS[:]
-    analysis_models = preferred_available(PREFERRED_ANALYSIS_MODELS, available_models) or PREFERRED_ANALYSIS_MODELS[:]
+    clean_models = preferred_available(PREFERRED_CLEAN_MODELS, available_models)
+    analysis_models = preferred_available(PREFERRED_ANALYSIS_MODELS, available_models)
+    if not clean_models:
+        clean_models = PREFERRED_CLEAN_MODELS[:]
+    if not analysis_models:
+        analysis_models = PREFERRED_ANALYSIS_MODELS[:]
 
     print(f"PASS: source episodes 1-200 found in {SOURCE_FOLDER}")
     print(f"Remote already complete: {len(completed)}/200")
