@@ -36,6 +36,7 @@ from pathlib import Path
 
 import requests
 from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub.utils import EntryNotFoundError, HfHubHTTPError, RepositoryNotFoundError
 
 # --------------------------------------------------------------------------
 # Configuration
@@ -160,6 +161,39 @@ NVIDIA_API_KEY = load_secret("NVIDIA_API_KEY")
 hf_api = HfApi(token=HF_TOKEN)
 
 
+def resolve_repo_type(repo_id, preferred_type):
+    """A repo can be type 'dataset' or 'model' on Hugging Face, and using the
+    wrong one makes every call fail as if the repo doesn't exist. Try the
+    configured type first, then the other one, so a wrong guess doesn't
+    silently break the whole run."""
+    candidates = [preferred_type] + [t for t in ("dataset", "model") if t != preferred_type]
+    last_exc = None
+    for candidate in candidates:
+        try:
+            hf_api.list_repo_files(repo_id=repo_id, repo_type=candidate)
+            if candidate != preferred_type:
+                print(f"NOTE: '{repo_id}' is actually repo_type='{candidate}', not '{preferred_type}'. Using '{candidate}'.")
+            return candidate
+        except RepositoryNotFoundError as exc:
+            last_exc = exc
+            continue
+        except HfHubHTTPError as exc:
+            status = getattr(exc.response, "status_code", None)
+            if status == 401:
+                print(
+                    f"FATAL: Hugging Face rejected HF_TOKEN as unauthorized (401) while checking '{repo_id}'. "
+                    f"Check that the token is valid and not expired.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            last_exc = exc
+            continue
+    raise RuntimeError(
+        f"Could not access repo '{repo_id}' as dataset or model with the given HF_TOKEN. "
+        f"Check the repo ID spelling and that the token has access to it. Last error: {last_exc}"
+    )
+
+
 # --------------------------------------------------------------------------
 # NVIDIA NIM: model discovery, model-specific payloads, robust calling
 # --------------------------------------------------------------------------
@@ -174,7 +208,7 @@ class AllModelsFailedError(Exception):
 
 def fetch_available_models():
     url = f"{NVIDIA_BASE_URL}/models"
-    headers = {"Authorization": f"Bearer {NVIDIA_API_KEY}"}
+    headers = {"Authorization": f"Bearer {NVIDIA_API_KEY}", "Accept": "application/json"}
     resp = requests.get(url, headers=headers, timeout=(30, 60))
     resp.raise_for_status()
     data = resp.json()
@@ -241,6 +275,7 @@ def call_nvidia_chat(model_id, messages, mode, max_retries=4):
     headers = {
         "Authorization": f"Bearer {NVIDIA_API_KEY}",
         "Content-Type": "application/json",
+        "Accept": "application/json",
     }
     payload = build_payload(model_id, messages, mode)
 
@@ -423,7 +458,14 @@ def download_raw_episode(ep):
 def list_completed_episodes():
     try:
         files = hf_api.list_repo_files(repo_id=OUTPUT_REPO_ID, repo_type=OUTPUT_REPO_TYPE)
-    except Exception:
+    except RepositoryNotFoundError:
+        return set()
+    except HfHubHTTPError as exc:
+        status = getattr(exc.response, "status_code", None)
+        if status == 401:
+            print(f"FATAL: HF_TOKEN unauthorized while reading '{OUTPUT_REPO_ID}'.", file=sys.stderr)
+            sys.exit(1)
+        print(f"WARNING: could not list files in '{OUTPUT_REPO_ID}' ({exc}); assuming nothing completed yet.")
         return set()
 
     a_prefix = f"{EXPORT_FOLDER}/TRACK_A_CLEAN_EPISODES/"
@@ -457,8 +499,14 @@ def download_existing_state_and_jsonl():
         )
         memory = json.loads(Path(p).read_text(encoding="utf-8"))
         print("Loaded existing STATE/story_memory.json.")
-    except Exception:
+    except (EntryNotFoundError, RepositoryNotFoundError):
         print("No existing story_memory.json found; starting fresh.")
+    except HfHubHTTPError as exc:
+        status = getattr(exc.response, "status_code", None)
+        if status == 401:
+            print(f"FATAL: HF_TOKEN unauthorized while reading STATE/story_memory.json.", file=sys.stderr)
+            sys.exit(1)
+        print(f"WARNING: could not load story_memory.json ({exc}); starting fresh.")
 
     for name in ("track_a.jsonl", "track_b.jsonl"):
         target = LOCAL_TRAINING / name
@@ -471,9 +519,16 @@ def download_existing_state_and_jsonl():
             )
             shutil.copyfile(p, target)
             print(f"Loaded existing {name}.")
-        except Exception:
+        except (EntryNotFoundError, RepositoryNotFoundError):
             target.write_text("", encoding="utf-8")
             print(f"No existing {name} found; starting fresh.")
+        except HfHubHTTPError as exc:
+            status = getattr(exc.response, "status_code", None)
+            if status == 401:
+                print(f"FATAL: HF_TOKEN unauthorized while reading {name}.", file=sys.stderr)
+                sys.exit(1)
+            target.write_text("", encoding="utf-8")
+            print(f"WARNING: could not load {name} ({exc}); starting fresh.")
 
     return memory
 
@@ -495,10 +550,38 @@ def upload_batch(up_to_episode):
 # --------------------------------------------------------------------------
 
 def main():
+    global SOURCE_REPO_TYPE, OUTPUT_REPO_TYPE
+
     print("Veda pipeline starting.")
     print(f"  Source: {SOURCE_REPO_ID} ({SOURCE_REPO_TYPE}) / {SOURCE_FOLDER}")
     print(f"  Output: {OUTPUT_REPO_ID} ({OUTPUT_REPO_TYPE}) / {EXPORT_FOLDER}")
     print(f"  Total episodes: {TOTAL_EPISODES}, batch size: {BATCH_SIZE}, cap this run: {MAX_EPISODES_THIS_RUN}")
+
+    # Confirm the source repo's real type (dataset vs model) before trusting the config default.
+    SOURCE_REPO_TYPE = resolve_repo_type(SOURCE_REPO_ID, SOURCE_REPO_TYPE)
+
+    # Resolve/create the output repo. If it's the same repo as the source, reuse the
+    # type we already confirmed instead of re-querying.
+    if OUTPUT_REPO_ID == SOURCE_REPO_ID:
+        OUTPUT_REPO_TYPE = SOURCE_REPO_TYPE
+    else:
+        try:
+            OUTPUT_REPO_TYPE = resolve_repo_type(OUTPUT_REPO_ID, OUTPUT_REPO_TYPE)
+        except RuntimeError:
+            print(f"Output repo '{OUTPUT_REPO_ID}' doesn't exist yet; creating it as repo_type='{OUTPUT_REPO_TYPE}'.")
+
+    try:
+        hf_api.create_repo(repo_id=OUTPUT_REPO_ID, repo_type=OUTPUT_REPO_TYPE, exist_ok=True)
+    except HfHubHTTPError as exc:
+        status = getattr(exc.response, "status_code", None)
+        if status == 401:
+            print(
+                f"FATAL: HF_TOKEN does not have write access to create/use '{OUTPUT_REPO_ID}'. "
+                f"Generate a token with 'write' permission at huggingface.co/settings/tokens.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        raise
 
     check_source_completeness()
 
