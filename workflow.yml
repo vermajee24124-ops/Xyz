@@ -1,20 +1,21 @@
-name: Veda Final Reference Builder
+name: Veda Pipeline
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "0 */6 * * *"   # every 6 hours; safe to run repeatedly, it auto-resumes
 
 permissions:
   contents: read
 
 concurrency:
-  group: veda-final-reference-builder
-  cancel-in-progress: false
+  group: veda-pipeline
+  cancel-in-progress: false   # never run two batches at once against the same output repo
 
 jobs:
-  build:
-    name: Clean transcripts + build training data
+  run-pipeline:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 350
 
     steps:
       - name: Checkout repository
@@ -26,13 +27,19 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install requests huggingface_hub
+        run: pip install -r requirements.txt
 
-      - name: Run builder
+      - name: Run Veda pipeline
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
-        run: |
-          python -u main.py
+          HF_SOURCE_REPO_ID: "Kumarverma11/PocketFM_Audio"
+          HF_SOURCE_REPO_TYPE: "dataset"
+          HF_SOURCE_FOLDER: "Transcripts_Episode_0001_to_0200"
+          HF_OUTPUT_REPO_ID: "Kumarverma11/PocketFM_Audio"
+          HF_OUTPUT_REPO_TYPE: "dataset"
+          HF_EXPORT_FOLDER: "Veda_Final_Training_Export_0001_to_0200"
+          TOTAL_EPISODES: "200"
+          BATCH_SIZE: "20"
+          MAX_EPISODES_THIS_RUN: "40"
+        run: python main.py
