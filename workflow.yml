@@ -33,6 +33,9 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          GEMINI_API_KEY_1: ${{ secrets.GEMINI_API_KEY_1 }}
+          GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
+          GEMINI_API_KEY_3: ${{ secrets.GEMINI_API_KEY_3 }}
           HF_SOURCE_REPO_ID: "Kumarverma11/PocketFM_Audio"
           HF_SOURCE_REPO_TYPE: "dataset"
           HF_SOURCE_FOLDER: "Transcripts_Episode_0001_to_0200"
@@ -42,4 +45,5 @@ jobs:
           TOTAL_EPISODES: "200"
           BATCH_SIZE: "20"
           MAX_EPISODES_THIS_RUN: "40"
+          PROVIDER_TIME_BUDGET_SECONDS: "600"
         run: python main.py
