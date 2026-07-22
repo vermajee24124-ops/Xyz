@@ -54,6 +54,16 @@ TOTAL_EPISODES = int(os.environ.get("TOTAL_EPISODES", "200"))
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "20"))
 MAX_EPISODES_THIS_RUN = int(os.environ.get("MAX_EPISODES_THIS_RUN", "40"))
 
+# Hard wall-clock budget (seconds) for a SINGLE track (clean OR extract) on a
+# single episode, covering all NVIDIA retries/fallbacks plus the Gemini backup.
+# This is the fix for the "stuck for 3-4 hours" problem: previously there was
+# no ceiling, so retries + model fallbacks could silently multiply into hours.
+# Worst case per episode is now roughly 2 x this value (clean + extract).
+PROVIDER_TIME_BUDGET_SECONDS = int(os.environ.get("PROVIDER_TIME_BUDGET_SECONDS", "600"))
+
+GEMINI_MODEL_ID = os.environ.get("GEMINI_MODEL_ID", "gemini-3.1-flash-lite")
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
+
 MERGED_RANGES = [(111, 120), (121, 130), (133, 135), (138, 139), (140, 143)]
 
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
@@ -155,8 +165,27 @@ def load_secret(name):
     return sanitize_secret(raw)
 
 
+def load_optional_secret(name):
+    """Like load_secret, but returns None instead of exiting - for secrets
+    that are backups/optional rather than required to run at all."""
+    raw = os.environ.get(name)
+    if not raw or not raw.strip():
+        return None
+    return sanitize_secret(raw)
+
+
 HF_TOKEN = load_secret("HF_TOKEN")
 NVIDIA_API_KEY = load_secret("NVIDIA_API_KEY")
+
+GEMINI_API_KEYS = [
+    key
+    for key in (
+        load_optional_secret("GEMINI_API_KEY_1"),
+        load_optional_secret("GEMINI_API_KEY_2"),
+        load_optional_secret("GEMINI_API_KEY_3"),
+    )
+    if key
+]
 
 hf_api = HfApi(token=HF_TOKEN)
 
@@ -253,9 +282,9 @@ def build_payload(model_id, messages, mode):
             "messages": messages,
             "temperature": 0.3,
             "top_p": 0.9,
-            "max_tokens": 8192 if mode == "extract" else 4096,
+            "max_tokens": 16384 if mode == "extract" else 8192,
             "stream": False,
-            "chat_template_kwargs": {"thinking": False},
+            "chat_template_kwargs": {"thinking": True},
         }
 
     # Unknown model family: minimal, conservative payload with no extra_body-style
@@ -270,7 +299,7 @@ def build_payload(model_id, messages, mode):
     }
 
 
-def call_nvidia_chat(model_id, messages, mode, max_retries=4):
+def call_nvidia_chat(model_id, messages, mode, deadline, max_retries=3):
     url = f"{NVIDIA_BASE_URL}/chat/completions"
     headers = {
         "Authorization": f"Bearer {NVIDIA_API_KEY}",
@@ -280,13 +309,20 @@ def call_nvidia_chat(model_id, messages, mode, max_retries=4):
     payload = build_payload(model_id, messages, mode)
 
     for attempt in range(1, max_retries + 1):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ModelUnavailableError(f"{model_id}: time budget exceeded before attempt {attempt}")
+
+        read_timeout = max(30, min(240, remaining))
         try:
-            resp = requests.post(url, headers=headers, json=payload, timeout=(30, 900))
+            resp = requests.post(url, headers=headers, json=payload, timeout=(30, read_timeout))
         except requests.exceptions.RequestException as exc:
             if attempt == max_retries:
                 raise ModelUnavailableError(f"{model_id} network error: {exc}") from exc
-            wait = attempt * 10
-            print(f"  [{model_id}] network error (attempt {attempt}/{max_retries}): {exc}. Retrying in {wait}s.")
+            wait = min(attempt * 10, max(0, deadline - time.monotonic()))
+            if wait <= 0:
+                raise ModelUnavailableError(f"{model_id}: time budget exceeded after network error")
+            print(f"  [{model_id}] network error (attempt {attempt}/{max_retries}): {exc}. Retrying in {wait:.0f}s.")
             time.sleep(wait)
             continue
 
@@ -305,8 +341,10 @@ def call_nvidia_chat(model_id, messages, mode, max_retries=4):
                 raise ModelUnavailableError(
                     f"{model_id} kept failing with {resp.status_code} after {max_retries} attempts"
                 )
-            wait = attempt * 15
-            print(f"  [{model_id}] got {resp.status_code} (attempt {attempt}/{max_retries}). Retrying in {wait}s.")
+            wait = min(attempt * 15, max(0, deadline - time.monotonic()))
+            if wait <= 0:
+                raise ModelUnavailableError(f"{model_id}: time budget exceeded after {resp.status_code}")
+            print(f"  [{model_id}] got {resp.status_code} (attempt {attempt}/{max_retries}). Retrying in {wait:.0f}s.")
             time.sleep(wait)
             continue
 
@@ -315,19 +353,23 @@ def call_nvidia_chat(model_id, messages, mode, max_retries=4):
     raise ModelUnavailableError(f"{model_id} failed after {max_retries} attempts")
 
 
-def run_with_shortlist(preferred_list, available_models, messages, mode):
+def run_with_shortlist(preferred_list, available_models, messages, mode, deadline):
     """Try each preferred model in order; on 400/401/403/404 or repeated
-    429/5xx, drop that model and fall through to the next one."""
+    429/5xx, drop that model and fall through to the next one. Stops the
+    moment the shared time budget runs out instead of trying forever."""
     remaining = list(preferred_list)
     working_available = list(available_models)
     tried = []
 
     while remaining:
+        if time.monotonic() > deadline:
+            tried.append("(stopped: time budget exceeded)")
+            break
         model_id = select_model(remaining, working_available)
         if model_id is None:
             break
         try:
-            result = call_nvidia_chat(model_id, messages, mode)
+            result = call_nvidia_chat(model_id, messages, mode, deadline)
             return result, model_id
         except ModelUnavailableError as exc:
             print(f"  Model unavailable, falling back: {exc}")
@@ -338,6 +380,114 @@ def run_with_shortlist(preferred_list, available_models, messages, mode):
             continue
 
     raise AllModelsFailedError(f"All candidate models failed or unavailable: {tried}")
+
+
+# --------------------------------------------------------------------------
+# Gemini: backup provider (used only after every NVIDIA model has failed)
+# --------------------------------------------------------------------------
+
+def to_gemini_payload(messages, mode):
+    """Convert OpenAI-style {role, content} messages into Gemini's
+    contents/systemInstruction shape, with thinking forced to HIGH."""
+    system_text = None
+    contents = []
+    for msg in messages:
+        if msg["role"] == "system":
+            system_text = (system_text + "\n" if system_text else "") + msg["content"]
+        else:
+            gemini_role = "model" if msg["role"] == "assistant" else "user"
+            contents.append({"role": gemini_role, "parts": [{"text": msg["content"]}]})
+
+    payload = {
+        "contents": contents,
+        "generationConfig": {
+            "temperature": 0.3,
+            "maxOutputTokens": 16384 if mode == "extract" else 8192,
+            "thinkingConfig": {"thinkingLevel": "HIGH"},
+        },
+    }
+    if system_text:
+        payload["systemInstruction"] = {"parts": [{"text": system_text}]}
+    return payload
+
+
+def call_gemini_chat(messages, mode, deadline, max_retries_per_key=2):
+    if not GEMINI_API_KEYS:
+        raise ModelUnavailableError("no Gemini API keys configured")
+
+    url = f"{GEMINI_BASE_URL}/models/{GEMINI_MODEL_ID}:generateContent"
+    payload = to_gemini_payload(messages, mode)
+    last_err = "no keys tried"
+
+    for key_index, api_key in enumerate(GEMINI_API_KEYS, start=1):
+        headers = {"x-goog-api-key": api_key, "Content-Type": "application/json"}
+
+        for attempt in range(1, max_retries_per_key + 1):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ModelUnavailableError(f"gemini: time budget exceeded ({last_err})")
+
+            read_timeout = max(30, min(180, remaining))
+            try:
+                resp = requests.post(url, headers=headers, json=payload, timeout=(30, read_timeout))
+            except requests.exceptions.RequestException as exc:
+                last_err = f"key #{key_index} network error: {exc}"
+                wait = min(attempt * 10, max(0, deadline - time.monotonic()))
+                if wait <= 0:
+                    break
+                time.sleep(wait)
+                continue
+
+            if resp.status_code == 200:
+                data = resp.json()
+                candidates = data.get("candidates", [])
+                if not candidates:
+                    last_err = f"key #{key_index}: no candidates in response"
+                    break
+                parts = candidates[0].get("content", {}).get("parts", [])
+                text = "".join(p.get("text", "") for p in parts if "text" in p)
+                if text.strip():
+                    return text
+                last_err = f"key #{key_index}: empty response text"
+                break
+
+            if resp.status_code in (400, 401, 403, 404):
+                # Quota exhausted (403) or bad key - move to the next key, not worth retrying this one.
+                last_err = f"key #{key_index} returned {resp.status_code}: {resp.text[:200]}"
+                break
+
+            if resp.status_code == 429 or resp.status_code >= 500:
+                last_err = f"key #{key_index} returned {resp.status_code}: {resp.text[:200]}"
+                wait = min(attempt * 15, max(0, deadline - time.monotonic()))
+                if wait <= 0:
+                    break
+                time.sleep(wait)
+                continue
+
+            last_err = f"key #{key_index} unexpected status {resp.status_code}: {resp.text[:200]}"
+            break
+
+    raise ModelUnavailableError(f"all Gemini keys exhausted: {last_err}")
+
+
+def process_track(nvidia_shortlist, available_models, messages, mode):
+    """Try NVIDIA models (primary) within a time budget; only if every NVIDIA
+    option is exhausted or the budget runs out, fall back to Gemini (backup)
+    for whatever budget remains."""
+    deadline = time.monotonic() + PROVIDER_TIME_BUDGET_SECONDS
+    try:
+        return run_with_shortlist(nvidia_shortlist, available_models, messages, mode, deadline)
+    except AllModelsFailedError as nvidia_exc:
+        if not GEMINI_API_KEYS:
+            raise
+        print(f"  NVIDIA models exhausted ({nvidia_exc}). Falling back to Gemini backup ({GEMINI_MODEL_ID}).")
+        try:
+            text = call_gemini_chat(messages, mode, deadline)
+            return text, GEMINI_MODEL_ID
+        except ModelUnavailableError as gemini_exc:
+            raise AllModelsFailedError(
+                f"NVIDIA failed ({nvidia_exc}) and Gemini backup also failed ({gemini_exc})"
+            )
 
 
 # --------------------------------------------------------------------------
@@ -556,6 +706,8 @@ def main():
     print(f"  Source: {SOURCE_REPO_ID} ({SOURCE_REPO_TYPE}) / {SOURCE_FOLDER}")
     print(f"  Output: {OUTPUT_REPO_ID} ({OUTPUT_REPO_TYPE}) / {EXPORT_FOLDER}")
     print(f"  Total episodes: {TOTAL_EPISODES}, batch size: {BATCH_SIZE}, cap this run: {MAX_EPISODES_THIS_RUN}")
+    print(f"  Per-track time budget: {PROVIDER_TIME_BUDGET_SECONDS}s (NVIDIA + Gemini backup combined)")
+    print(f"  Gemini backup keys configured: {len(GEMINI_API_KEYS)} (model: {GEMINI_MODEL_ID})")
 
     # Confirm the source repo's real type (dataset vs model) before trusting the config default.
     SOURCE_REPO_TYPE = resolve_repo_type(SOURCE_REPO_ID, SOURCE_REPO_TYPE)
@@ -620,7 +772,7 @@ def main():
                     next_head = download_raw_episode(ep + 1)[:600]
 
             clean_messages = build_clean_messages(ep, raw_text, prev_tail, next_head)
-            cleaned_text, clean_model = run_with_shortlist(
+            cleaned_text, clean_model = process_track(
                 CLEAN_MODEL_SHORTLIST, available_models, clean_messages, mode="clean"
             )
             cleaned_text = cleaned_text.strip()
@@ -629,7 +781,7 @@ def main():
             (LOCAL_TRACK_A / f"Episode_{ep:04d}.txt").write_text(cleaned_text, encoding="utf-8")
 
             extract_messages = build_extract_messages(ep, cleaned_text, story_memory)
-            raw_json_response, extract_model = run_with_shortlist(
+            raw_json_response, extract_model = process_track(
                 ANALYSIS_MODEL_SHORTLIST, available_models, extract_messages, mode="extract"
             )
             track_b_data = parse_track_b_json(raw_json_response, ep)
