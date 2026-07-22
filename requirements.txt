@@ -1,2 +1,2 @@
-requests>=2.31.0
-huggingface_hub>=0.24.0
+requests>=2.32.0
+huggingface_hub>=0.33.0,<1.0
