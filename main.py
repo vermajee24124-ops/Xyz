@@ -63,11 +63,31 @@ PROVIDER_TIME_BUDGET_SECONDS = int(os.environ.get("PROVIDER_TIME_BUDGET_SECONDS"
 GEMINI_MODEL_ID = os.environ.get("GEMINI_MODEL_ID", "gemini-3.1-flash-lite")
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+# Best free models on OpenRouter as of when this was written, in priority
+# order. All verified to exist as real, official OpenRouter free listings -
+# not a bypass of any provider's own authentication, just OpenRouter's own
+# legitimate free tier.
+OPENROUTER_MODEL_SHORTLIST = [
+    "nvidia/nemotron-3-ultra-550b-a55b:free",
+    "nvidia/nemotron-3-super-120b-a12b:free",
+    "google/gemma-4-31b-it:free",
+    "openai/gpt-oss-20b:free",
+]
+
 # huggingface_hub calls (list_repo_files, hf_hub_download, upload_folder, create_repo)
 # accept no timeout parameter at all, so a network stall can hang them forever.
 # Every such call in this script is wrapped with hf_call() below, which enforces
 # this hard wall-clock limit using SIGALRM (Linux only - fine for GitHub Actions).
 HF_CALL_TIMEOUT_SECONDS = int(os.environ.get("HF_CALL_TIMEOUT_SECONDS", "90"))
+
+# A real cleaned episode should be roughly as long as the raw transcript it
+# came from. If a model returns a short/truncated/garbage response, it must
+# be rejected here instead of silently uploaded - this is the fix for
+# episodes like #99 that landed on Hugging Face as a few words instead of
+# a full ~2000-word episode.
+MIN_CLEAN_LENGTH_RATIO = float(os.environ.get("MIN_CLEAN_LENGTH_RATIO", "0.5"))
+MIN_CLEAN_LENGTH_CHARS = int(os.environ.get("MIN_CLEAN_LENGTH_CHARS", "800"))
 
 MERGED_RANGES = [(111, 120), (121, 130), (133, 135), (138, 139), (140, 143)]
 
@@ -191,6 +211,8 @@ GEMINI_API_KEYS = [
     )
     if key
 ]
+
+OPENROUTER_API_KEY = load_optional_secret("OPENROUTER_API_KEY")
 
 hf_api = HfApi(token=HF_TOKEN)
 
@@ -409,6 +431,95 @@ def run_with_shortlist(preferred_list, available_models, messages, mode, deadlin
 
 
 # --------------------------------------------------------------------------
+# OpenRouter: second-tier fallback (tried after NVIDIA, before Gemini)
+# --------------------------------------------------------------------------
+
+def call_openrouter_chat(model_id, messages, mode, deadline, max_retries=3):
+    url = f"{OPENROUTER_BASE_URL}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://github.com/",
+        "X-Title": "Veda Pipeline",
+    }
+    payload = {
+        "model": model_id,
+        "messages": messages,
+        "temperature": 0.3,
+        "top_p": 0.9,
+        "max_tokens": 16384 if mode == "extract" else 8192,
+        "stream": False,
+        "reasoning": {"effort": "high"},
+    }
+
+    for attempt in range(1, max_retries + 1):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ModelUnavailableError(f"{model_id}: time budget exceeded before attempt {attempt}")
+
+        read_timeout = max(30, min(240, remaining))
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=(30, read_timeout))
+        except requests.exceptions.RequestException as exc:
+            if attempt == max_retries:
+                raise ModelUnavailableError(f"{model_id} network error: {exc}") from exc
+            wait = min(attempt * 10, max(0, deadline - time.monotonic()))
+            if wait <= 0:
+                raise ModelUnavailableError(f"{model_id}: time budget exceeded after network error")
+            print(f"  [{model_id}] network error (attempt {attempt}/{max_retries}): {exc}. Retrying in {wait:.0f}s.")
+            time.sleep(wait)
+            continue
+
+        if resp.status_code == 200:
+            data = resp.json()
+            choices = data.get("choices") or []
+            if not choices:
+                raise ModelUnavailableError(f"{model_id}: no choices in response")
+            content = choices[0].get("message", {}).get("content") or ""
+            return content
+
+        if resp.status_code in (400, 401, 403, 404):
+            snippet = resp.text[:300].replace("\n", " ")
+            raise ModelUnavailableError(f"{model_id} returned {resp.status_code}: {snippet}")
+
+        if resp.status_code == 429 or resp.status_code >= 500:
+            if attempt == max_retries:
+                raise ModelUnavailableError(
+                    f"{model_id} kept failing with {resp.status_code} after {max_retries} attempts"
+                )
+            wait = min(attempt * 15, max(0, deadline - time.monotonic()))
+            if wait <= 0:
+                raise ModelUnavailableError(f"{model_id}: time budget exceeded after {resp.status_code}")
+            print(f"  [{model_id}] got {resp.status_code} (attempt {attempt}/{max_retries}). Retrying in {wait:.0f}s.")
+            time.sleep(wait)
+            continue
+
+        raise ModelUnavailableError(f"{model_id} returned unexpected status {resp.status_code}: {resp.text[:300]}")
+
+    raise ModelUnavailableError(f"{model_id} failed after {max_retries} attempts")
+
+
+def run_openrouter_shortlist(messages, mode, deadline):
+    if not OPENROUTER_API_KEY:
+        raise AllModelsFailedError("no OPENROUTER_API_KEY configured")
+
+    tried = []
+    for model_id in OPENROUTER_MODEL_SHORTLIST:
+        if time.monotonic() > deadline:
+            tried.append("(stopped: time budget exceeded)")
+            break
+        try:
+            result = call_openrouter_chat(model_id, messages, mode, deadline)
+            return result, model_id
+        except ModelUnavailableError as exc:
+            print(f"  OpenRouter model unavailable, falling back: {exc}")
+            tried.append(model_id)
+            continue
+
+    raise AllModelsFailedError(f"All OpenRouter free models failed or unavailable: {tried}")
+
+
+# --------------------------------------------------------------------------
 # Gemini: backup provider (used only after every NVIDIA model has failed)
 # --------------------------------------------------------------------------
 
@@ -497,23 +608,37 @@ def call_gemini_chat(messages, mode, deadline, max_retries_per_key=2):
 
 
 def process_track(nvidia_shortlist, available_models, messages, mode):
-    """Try NVIDIA models (primary) within a time budget; only if every NVIDIA
-    option is exhausted or the budget runs out, fall back to Gemini (backup)
-    for whatever budget remains."""
+    """Try NVIDIA models (primary) within a time budget; if every NVIDIA
+    option is exhausted, try OpenRouter's free models; only if that also
+    fails, fall back to Gemini for whatever budget remains."""
     deadline = time.monotonic() + PROVIDER_TIME_BUDGET_SECONDS
+    nvidia_err = None
+    openrouter_err = None
+
     try:
         return run_with_shortlist(nvidia_shortlist, available_models, messages, mode, deadline)
-    except AllModelsFailedError as nvidia_exc:
-        if not GEMINI_API_KEYS:
-            raise
-        print(f"  NVIDIA models exhausted ({nvidia_exc}). Falling back to Gemini backup ({GEMINI_MODEL_ID}).")
-        try:
-            text = call_gemini_chat(messages, mode, deadline)
-            return text, GEMINI_MODEL_ID
-        except ModelUnavailableError as gemini_exc:
-            raise AllModelsFailedError(
-                f"NVIDIA failed ({nvidia_exc}) and Gemini backup also failed ({gemini_exc})"
-            )
+    except AllModelsFailedError as exc:
+        nvidia_err = exc
+
+    try:
+        print(f"  NVIDIA models exhausted ({nvidia_err}). Trying OpenRouter free models.")
+        return run_openrouter_shortlist(messages, mode, deadline)
+    except AllModelsFailedError as exc:
+        openrouter_err = exc
+
+    if not GEMINI_API_KEYS:
+        raise AllModelsFailedError(
+            f"NVIDIA failed ({nvidia_err}) and OpenRouter failed ({openrouter_err}); no Gemini keys configured"
+        )
+    print(f"  OpenRouter also exhausted ({openrouter_err}). Falling back to Gemini backup ({GEMINI_MODEL_ID}).")
+    try:
+        text = call_gemini_chat(messages, mode, deadline)
+        return text, GEMINI_MODEL_ID
+    except ModelUnavailableError as gemini_exc:
+        raise AllModelsFailedError(
+            f"NVIDIA failed ({nvidia_err}), OpenRouter failed ({openrouter_err}), "
+            f"and Gemini backup also failed ({gemini_exc})"
+        )
 
 
 # --------------------------------------------------------------------------
@@ -750,6 +875,7 @@ def main():
     print(f"  Total episodes: {TOTAL_EPISODES}, batch size: {BATCH_SIZE}, cap this run: {MAX_EPISODES_THIS_RUN}")
     print(f"  Per-track time budget: {PROVIDER_TIME_BUDGET_SECONDS}s (NVIDIA + Gemini backup combined)")
     print(f"  Gemini backup keys configured: {len(GEMINI_API_KEYS)} (model: {GEMINI_MODEL_ID})")
+    print(f"  OpenRouter configured: {bool(OPENROUTER_API_KEY)} (shortlist: {OPENROUTER_MODEL_SHORTLIST})")
 
     # Confirm the source repo's real type (dataset vs model) before trusting the config default.
     SOURCE_REPO_TYPE = resolve_repo_type(SOURCE_REPO_ID, SOURCE_REPO_TYPE)
@@ -823,6 +949,13 @@ def main():
             cleaned_text = cleaned_text.strip()
             if not cleaned_text:
                 raise ValueError("Track A returned empty cleaned text")
+            min_required = max(MIN_CLEAN_LENGTH_CHARS, int(len(raw_text) * MIN_CLEAN_LENGTH_RATIO))
+            if len(cleaned_text) < min_required:
+                raise ValueError(
+                    f"Track A output looks truncated/garbage: got {len(cleaned_text)} chars, "
+                    f"expected at least {min_required} chars (raw was {len(raw_text)} chars). "
+                    f"Rejecting instead of uploading a broken episode."
+                )
             (LOCAL_TRACK_A / f"Episode_{ep:04d}.txt").write_text(cleaned_text, encoding="utf-8")
 
             extract_messages = build_extract_messages(ep, cleaned_text, story_memory)
@@ -830,6 +963,8 @@ def main():
                 ANALYSIS_MODEL_SHORTLIST, available_models, extract_messages, mode="extract"
             )
             track_b_data = parse_track_b_json(raw_json_response, ep)
+            if len(track_b_data.get("story_summary", "")) < 15:
+                raise ValueError("Track B output looks garbage: story_summary is empty/too short")
             (LOCAL_TRACK_B / f"Episode_{ep:04d}.json").write_text(
                 json.dumps(track_b_data, ensure_ascii=False, indent=2), encoding="utf-8"
             )
