@@ -43,7 +43,7 @@ jobs:
           HF_OUTPUT_REPO_TYPE: "dataset"
           HF_EXPORT_FOLDER: "Veda_Final_Training_Export_0001_to_0200"
           TOTAL_EPISODES: "200"
-          BATCH_SIZE: "20"
+          BATCH_SIZE: "1"
           MAX_EPISODES_THIS_RUN: "40"
-          PROVIDER_TIME_BUDGET_SECONDS: "600"
+          PROVIDER_TIME_BUDGET_SECONDS: "300"
         run: python main.py
