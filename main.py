@@ -30,6 +30,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import sys
 import time
 from pathlib import Path
@@ -51,18 +52,22 @@ OUTPUT_REPO_TYPE = os.environ.get("HF_OUTPUT_REPO_TYPE", "dataset")
 EXPORT_FOLDER = os.environ.get("HF_EXPORT_FOLDER", "Veda_Final_Training_Export_0001_to_0200")
 
 TOTAL_EPISODES = int(os.environ.get("TOTAL_EPISODES", "200"))
-BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "20"))
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "1"))
 MAX_EPISODES_THIS_RUN = int(os.environ.get("MAX_EPISODES_THIS_RUN", "40"))
 
 # Hard wall-clock budget (seconds) for a SINGLE track (clean OR extract) on a
 # single episode, covering all NVIDIA retries/fallbacks plus the Gemini backup.
-# This is the fix for the "stuck for 3-4 hours" problem: previously there was
-# no ceiling, so retries + model fallbacks could silently multiply into hours.
 # Worst case per episode is now roughly 2 x this value (clean + extract).
-PROVIDER_TIME_BUDGET_SECONDS = int(os.environ.get("PROVIDER_TIME_BUDGET_SECONDS", "600"))
+PROVIDER_TIME_BUDGET_SECONDS = int(os.environ.get("PROVIDER_TIME_BUDGET_SECONDS", "300"))
 
 GEMINI_MODEL_ID = os.environ.get("GEMINI_MODEL_ID", "gemini-3.1-flash-lite")
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
+
+# huggingface_hub calls (list_repo_files, hf_hub_download, upload_folder, create_repo)
+# accept no timeout parameter at all, so a network stall can hang them forever.
+# Every such call in this script is wrapped with hf_call() below, which enforces
+# this hard wall-clock limit using SIGALRM (Linux only - fine for GitHub Actions).
+HF_CALL_TIMEOUT_SECONDS = int(os.environ.get("HF_CALL_TIMEOUT_SECONDS", "90"))
 
 MERGED_RANGES = [(111, 120), (121, 130), (133, 135), (138, 139), (140, 143)]
 
@@ -190,6 +195,23 @@ GEMINI_API_KEYS = [
 hf_api = HfApi(token=HF_TOKEN)
 
 
+def hf_call(func, *args, **kwargs):
+    """Run any Hugging Face Hub call under a hard wall-clock timeout. This
+    library exposes no timeout parameter for list_repo_files/hf_hub_download/
+    upload_folder/create_repo, so without this a single network stall on any
+    of them can hang the whole job with zero progress and no error."""
+    def _handler(signum, frame):
+        raise TimeoutError(f"Hugging Face call '{func.__name__}' exceeded {HF_CALL_TIMEOUT_SECONDS}s hard timeout")
+
+    old_handler = signal.signal(signal.SIGALRM, _handler)
+    signal.alarm(HF_CALL_TIMEOUT_SECONDS)
+    try:
+        return func(*args, **kwargs)
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
+
+
 def resolve_repo_type(repo_id, preferred_type):
     """A repo can be type 'dataset' or 'model' on Hugging Face, and using the
     wrong one makes every call fail as if the repo doesn't exist. Try the
@@ -199,11 +221,15 @@ def resolve_repo_type(repo_id, preferred_type):
     last_exc = None
     for candidate in candidates:
         try:
-            hf_api.list_repo_files(repo_id=repo_id, repo_type=candidate)
+            hf_call(hf_api.list_repo_files, repo_id=repo_id, repo_type=candidate)
             if candidate != preferred_type:
                 print(f"NOTE: '{repo_id}' is actually repo_type='{candidate}', not '{preferred_type}'. Using '{candidate}'.")
             return candidate
         except RepositoryNotFoundError as exc:
+            last_exc = exc
+            continue
+        except TimeoutError as exc:
+            print(f"WARNING: {exc}; retrying with the other repo_type.")
             last_exc = exc
             continue
         except HfHubHTTPError as exc:
@@ -563,7 +589,11 @@ def parse_track_b_json(raw_response, ep):
 # --------------------------------------------------------------------------
 
 def check_source_completeness():
-    files = hf_api.list_repo_files(repo_id=SOURCE_REPO_ID, repo_type=SOURCE_REPO_TYPE)
+    try:
+        files = hf_call(hf_api.list_repo_files, repo_id=SOURCE_REPO_ID, repo_type=SOURCE_REPO_TYPE)
+    except TimeoutError as exc:
+        print(f"FATAL: {exc} while listing source repo files. Check network/Hugging Face status and retry.", file=sys.stderr)
+        sys.exit(1)
     prefix = f"{SOURCE_FOLDER}/"
     pattern = re.compile(r"Episode_(\d{4})\.txt$")
     seen = {}
@@ -594,7 +624,8 @@ def download_raw_episode(ep):
     if ep in _raw_cache:
         return _raw_cache[ep]
     filename = f"{SOURCE_FOLDER}/Episode_{ep:04d}.txt"
-    local_path = hf_hub_download(
+    local_path = hf_call(
+        hf_hub_download,
         repo_id=SOURCE_REPO_ID,
         repo_type=SOURCE_REPO_TYPE,
         filename=filename,
@@ -607,8 +638,11 @@ def download_raw_episode(ep):
 
 def list_completed_episodes():
     try:
-        files = hf_api.list_repo_files(repo_id=OUTPUT_REPO_ID, repo_type=OUTPUT_REPO_TYPE)
+        files = hf_call(hf_api.list_repo_files, repo_id=OUTPUT_REPO_ID, repo_type=OUTPUT_REPO_TYPE)
     except RepositoryNotFoundError:
+        return set()
+    except TimeoutError as exc:
+        print(f"WARNING: {exc} while checking completed episodes; assuming none completed yet.")
         return set()
     except HfHubHTTPError as exc:
         status = getattr(exc.response, "status_code", None)
@@ -641,7 +675,8 @@ def download_existing_state_and_jsonl():
     and keep the training JSONL files cumulative across runs."""
     memory = {}
     try:
-        p = hf_hub_download(
+        p = hf_call(
+            hf_hub_download,
             repo_id=OUTPUT_REPO_ID,
             repo_type=OUTPUT_REPO_TYPE,
             filename=f"{EXPORT_FOLDER}/STATE/story_memory.json",
@@ -651,6 +686,8 @@ def download_existing_state_and_jsonl():
         print("Loaded existing STATE/story_memory.json.")
     except (EntryNotFoundError, RepositoryNotFoundError):
         print("No existing story_memory.json found; starting fresh.")
+    except TimeoutError as exc:
+        print(f"WARNING: {exc} while loading story_memory.json; starting fresh.")
     except HfHubHTTPError as exc:
         status = getattr(exc.response, "status_code", None)
         if status == 401:
@@ -661,7 +698,8 @@ def download_existing_state_and_jsonl():
     for name in ("track_a.jsonl", "track_b.jsonl"):
         target = LOCAL_TRAINING / name
         try:
-            p = hf_hub_download(
+            p = hf_call(
+                hf_hub_download,
                 repo_id=OUTPUT_REPO_ID,
                 repo_type=OUTPUT_REPO_TYPE,
                 filename=f"{EXPORT_FOLDER}/TRAINING_DATASETS/{name}",
@@ -672,6 +710,9 @@ def download_existing_state_and_jsonl():
         except (EntryNotFoundError, RepositoryNotFoundError):
             target.write_text("", encoding="utf-8")
             print(f"No existing {name} found; starting fresh.")
+        except TimeoutError as exc:
+            target.write_text("", encoding="utf-8")
+            print(f"WARNING: {exc} while loading {name}; starting fresh.")
         except HfHubHTTPError as exc:
             status = getattr(exc.response, "status_code", None)
             if status == 401:
@@ -684,7 +725,8 @@ def download_existing_state_and_jsonl():
 
 
 def upload_batch(up_to_episode):
-    hf_api.upload_folder(
+    hf_call(
+        hf_api.upload_folder,
         repo_id=OUTPUT_REPO_ID,
         repo_type=OUTPUT_REPO_TYPE,
         folder_path=str(LOCAL_ROOT),
@@ -723,7 +765,9 @@ def main():
             print(f"Output repo '{OUTPUT_REPO_ID}' doesn't exist yet; creating it as repo_type='{OUTPUT_REPO_TYPE}'.")
 
     try:
-        hf_api.create_repo(repo_id=OUTPUT_REPO_ID, repo_type=OUTPUT_REPO_TYPE, exist_ok=True)
+        hf_call(hf_api.create_repo, repo_id=OUTPUT_REPO_ID, repo_type=OUTPUT_REPO_TYPE, exist_ok=True)
+    except TimeoutError as exc:
+        print(f"WARNING: {exc}; assuming the output repo already exists and continuing.")
     except HfHubHTTPError as exc:
         status = getattr(exc.response, "status_code", None)
         if status == 401:
@@ -761,6 +805,7 @@ def main():
             break
 
         print(f"--- Episode {ep} ---")
+        episode_start = time.monotonic()
         try:
             raw_text = download_raw_episode(ep)
 
@@ -799,28 +844,38 @@ def main():
                 json.dumps(story_memory, ensure_ascii=False, indent=2), encoding="utf-8"
             )
 
-            print(f"Episode {ep} done (clean={clean_model}, extract={extract_model}).")
+            elapsed = time.monotonic() - episode_start
+            print(f"Episode {ep} done in {elapsed:.0f}s (clean={clean_model}, extract={extract_model}).")
             processed_since_upload += 1
             processed_this_run += 1
             last_ep = ep
 
         except AllModelsFailedError as exc:
-            print(f"Episode {ep} FAILED (all models exhausted): {exc}")
+            elapsed = time.monotonic() - episode_start
+            print(f"Episode {ep} FAILED after {elapsed:.0f}s (all models exhausted): {exc}")
             failures.append(ep)
         except Exception as exc:
-            print(f"Episode {ep} FAILED (unexpected error): {exc}")
+            elapsed = time.monotonic() - episode_start
+            print(f"Episode {ep} FAILED after {elapsed:.0f}s (unexpected error): {exc}")
             failures.append(ep)
 
         if processed_since_upload >= BATCH_SIZE:
-            print("Uploading batch to Hugging Face...")
-            upload_batch(last_ep)
-            processed_since_upload = 0
+            try:
+                print("Uploading batch to Hugging Face...")
+                upload_batch(last_ep)
+                processed_since_upload = 0
+            except Exception as exc:
+                print(f"WARNING: batch upload failed ({exc}); will retry after the next episode.")
 
         time.sleep(2)  # small delay between episodes to stay well under the rate limit
 
     if processed_since_upload > 0:
-        print("Uploading final partial batch for this run...")
-        upload_batch(last_ep)
+        try:
+            print("Uploading final partial batch for this run...")
+            upload_batch(last_ep)
+        except Exception as exc:
+            print(f"WARNING: final batch upload failed ({exc}). Already-written local files are lost with the "
+                  f"runner, but every earlier per-episode upload this run already succeeded on Hugging Face.")
 
     print(f"Run finished. Processed {processed_this_run} episode(s) this run.")
     if failures:
